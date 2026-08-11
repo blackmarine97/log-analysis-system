@@ -1,0 +1,19 @@
+# build trees
+build/
+build-client/
+out/
+
+# the 500 MB sample log (exceeds GitHub file limits)
+Test_Log.log
+
+# local run artifacts
+*.csv
+server_run*.log
+log_server.log
+vg_*.txt
+mini.log
+imgui.ini
+
+# IDE
+.vs/
+.vscode/
