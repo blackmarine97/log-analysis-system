@@ -44,6 +44,13 @@ cmake --build build -j
 `--daemon` detaches the process into the background (output goes to the
 `--log` file). Stop it gracefully with `SIGTERM`.
 
+> **Note for WSL users**: WSL shuts down its VM shortly after the last
+> process exits, which can silently take a freshly daemonized server down
+> with it. When testing under WSL, prefer running the server in the
+> foreground in a terminal you keep open (just omit `--daemon`), or verify
+> the port after starting: `ss -tln | grep 5555`. On a regular Linux host
+> `--daemon` behaves normally.
+
 Run the parser unit tests (uses the provided sample log):
 
 ```bash
