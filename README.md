@@ -44,6 +44,10 @@ cmake --build build -j
 `--daemon` detaches the process into the background (output goes to the
 `--log` file). Stop it gracefully with `SIGTERM`.
 
+`--bind` takes an IPv4 literal (`0.0.0.0`, `127.0.0.1`). A hostname or a
+malformed address is rejected with a non-zero exit code rather than being
+silently downgraded to "listen on every interface".
+
 > **Note for WSL users**: WSL shuts down its VM shortly after the last
 > process exits, which can silently take a freshly daemonized server down
 > with it. When testing under WSL, prefer running the server in the
@@ -51,7 +55,10 @@ cmake --build build -j
 > the port after starting: `ss -tln | grep 5555`. On a regular Linux host
 > `--daemon` behaves normally.
 
-Run the parser unit tests (uses the provided sample log):
+Run the parser unit tests. The stream test needs a log file; `Test_Log.log`
+is the 500 MB sample supplied with the assignment and is deliberately **not**
+committed (it exceeds GitHub's file size limit), so copy it into the repo root
+first — any log in the same format works:
 
 ```bash
 ./build/server/parser_test Test_Log.log
@@ -127,9 +134,15 @@ The 500 MB file is **never** held in memory, on either side:
   between calls, so state is one line + the statistics map.
 - A poison "line" that never ends is capped: if the carry buffer exceeds
   1 MiB without a newline it is dropped as one malformed line and the
-  parser resynchronizes at the next `\n`.
+  parser resynchronizes at the next `\n`. It is counted exactly once no
+  matter how many `feed()` calls it spans.
 - Statistics are running aggregates (count map + sum/count for the average),
-  so memory is independent of line count.
+  so memory does not grow with the line count. The one input-dependent
+  structure is the `(date_hour, module)` map; since corrupt data could invent
+  unbounded module names, module names are restricted to identifiers of at
+  most 128 chars and the map is capped at 100k distinct keys (anything beyond
+  folds into an `__overflow__` bucket per hour, so the counts still
+  reconcile with `parsed_lines`).
 
 **Measured** (full 483 MiB upload, `/usr/bin/time -v`):
 
@@ -145,9 +158,20 @@ definitely lost: 0 bytes   indirectly lost: 0 bytes   possibly lost: 0 bytes
 ERROR SUMMARY: 0 errors from 0 contexts
 ```
 
-No `new`/`delete`/`malloc`/`free` appears anywhere in the sources; all
-dynamic memory is owned by STL containers, `std::unique_ptr`, or (on the
-client) `Microsoft::WRL::ComPtr` for D3D COM objects.
+No `new`/`delete`/`malloc`/`free` appears anywhere in the first-party
+sources (`client/`, `common/`, `server/`); all dynamic memory is owned by
+STL containers, `std::unique_ptr`, or (on the client)
+`Microsoft::WRL::ComPtr` for D3D COM objects. This is verifiable with:
+
+```bash
+grep -rnE '\b(new|delete|malloc|free|calloc|realloc)\b' client common server
+```
+
+(the only hits are `= delete` on copy constructors, which is the
+special-member-deletion syntax, not memory management). The third-party
+dependencies — libuv on the server, Dear ImGui on the client — are ordinary
+C/C++ libraries with their own allocators and are out of scope for that
+rule; they are fetched into the build tree, never vendored into the sources.
 
 ## Corrupted ("Poison") Data Handling
 
@@ -155,8 +179,12 @@ client) `Microsoft::WRL::ComPtr` for D3D COM objects.
 `std::optional<ParsedLine>` and rejects a line on **any** structural
 violation (two-stage validation):
 
-1. **Structural**: fixed-width timestamp with separator/digit/hour-range
-   checks, three numeric `[n]` fields, `BYDA::<Module>:` prefix.
+1. **Structural**: fixed-width timestamp with separator/digit checks and
+   calendar range checks (month 1-12, day 1-31, hour 0-23, minute/second
+   0-59), three numeric `[n]` fields, and a `BYDA::<Module>:` prefix whose
+   module name must be an identifier (`[A-Za-z0-9_]`, <= 128 chars) — an
+   unexpected character there is corruption, and would otherwise become an
+   unescapable CSV key.
 2. **Semantic**: if a `spd[...]` field is present but unparseable,
    unterminated, negative, or physically implausible (`>= 1e9`), the whole
    line is treated as corrupt — poison values can never contaminate the
@@ -193,4 +221,7 @@ summary,skipped_lines,,19
 ```
 
 Task 1 rows (`module_count`) group occurrences by (date+hour, module);
-summary rows carry the Task 2 average and the parse accounting.
+summary rows carry the Task 2 average and the parse accounting. Fields are
+written per RFC 4180 (quoted, with embedded quotes doubled, whenever a value
+would otherwise contain a delimiter), and
+`parsed_lines + skipped_lines == total lines received` always holds.

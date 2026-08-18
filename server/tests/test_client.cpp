@@ -123,7 +123,13 @@ int main(int argc, char** argv) {
     std::vector<char> buf(1 << 20);
     uint64_t sent = 0;
     while (sent < fileSize) {
-        in.read(buf.data(), buf.size());
+        // Clamp to the size announced in the header: a log that grows during
+        // the upload must not push bytes past the end of the frame payload.
+        const uint64_t remaining = fileSize - sent;
+        const size_t want = remaining < buf.size()
+                                ? static_cast<size_t>(remaining)
+                                : buf.size();
+        in.read(buf.data(), static_cast<std::streamsize>(want));
         const std::streamsize n = in.gcount();
         if (n <= 0) { std::cerr << "file read error\n"; return 1; }
         if (!sendAll(fd.get(), buf.data(), static_cast<size_t>(n))) return 1;

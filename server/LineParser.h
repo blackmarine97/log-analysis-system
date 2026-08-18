@@ -38,9 +38,16 @@ public:
             !allDigits(ts.substr(20, 6)))
             return std::nullopt;
 
-        // Range sanity (hour 00-23 is what Task 1 groups by).
-        int hour = (ts[11] - '0') * 10 + (ts[12] - '0');
-        if (hour > 23) return std::nullopt;
+        // Range sanity. Hour is what Task 1 groups by, but an out-of-range
+        // month/day is just as much a "format mismatch" as a bad hour.
+        const int month = two(ts, 5);
+        const int day   = two(ts, 8);
+        const int hour  = two(ts, 11);
+        const int min   = two(ts, 14);
+        const int sec   = two(ts, 17);
+        if (month < 1 || month > 12 || day < 1 || day > 31 ||
+            hour > 23 || min > 59 || sec > 59)
+            return std::nullopt;
 
         ParsedLine out;
         out.dateHour.reserve(13);
@@ -66,7 +73,14 @@ public:
         pos += kPrefix.size();
         size_t modEnd = line.find(':', pos);
         if (modEnd == std::string_view::npos || modEnd == pos) return std::nullopt;
-        out.module.assign(line.substr(pos, modEnd - pos));
+        const std::string_view module = line.substr(pos, modEnd - pos);
+        // A module name is an identifier. Anything else ("unexpected chars" in
+        // the assignment's corruption taxonomy) makes the line corrupt: it
+        // would otherwise become an unbounded, unescapable CSV key.
+        if (module.size() > kMaxModuleLen) return std::nullopt;
+        for (char c : module)
+            if (!isIdentChar(c)) return std::nullopt;
+        out.module.assign(module);
 
         // --- 4. Optional spd[<double>] with semantic (range) validation -----
         // A line that carries a spd[] field whose value is unparseable or
@@ -84,8 +98,19 @@ public:
     // anything at or beyond 1e9 (or negative) is treated as corruption.
     static constexpr double kMaxPlausibleSpeed = 1e9;
 
+    // Longest accepted BYDA::<Module> name. Real modules are ~20 chars; the
+    // bound stops corrupt data from turning a whole log line into a map key.
+    static constexpr size_t kMaxModuleLen = 128;
+
 private:
     enum class SpeedField { None, Valid, Corrupt };
+
+    // Two ASCII digits at `off` as an int; callers have already verified that
+    // the positions are digits.
+    static int two(std::string_view s, size_t off) noexcept {
+        return (s[off] - '0') * 10 + (s[off + 1] - '0');
+    }
+
     static bool allDigits(std::string_view s) noexcept {
         if (s.empty()) return false;
         for (char c : s)

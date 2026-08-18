@@ -93,11 +93,16 @@ int main(int argc, char** argv) {
     struct Ctx { TcpServer* srv; uv_signal_t* a; uv_signal_t* b; };
     Ctx ctx{&server, &sigint, &sigterm};
     sigint.data = sigterm.data = &ctx;
+    // Both handles are closed on the first signal. The uv_is_closing() guards
+    // matter when SIGINT and SIGTERM land in the same loop iteration: the
+    // second callback would otherwise uv_close() an already-closing handle.
     auto onSignal = [](uv_signal_t* h, int /*signum*/) {
         auto* c = static_cast<Ctx*>(h->data);
         c->srv->shutdown();
-        uv_close(reinterpret_cast<uv_handle_t*>(c->a), nullptr);
-        uv_close(reinterpret_cast<uv_handle_t*>(c->b), nullptr);
+        for (uv_signal_t* s : {c->a, c->b}) {
+            auto* handle = reinterpret_cast<uv_handle_t*>(s);
+            if (!uv_is_closing(handle)) uv_close(handle, nullptr);
+        }
     };
     uv_signal_start(&sigint, onSignal, SIGINT);
     uv_signal_start(&sigterm, onSignal, SIGTERM);

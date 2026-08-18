@@ -221,7 +221,14 @@ private:
         std::vector<char> buf(kChunkSize);
         uint64_t sent = 0;
         while (ok && sent < fileSize) {
-            in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+            // Never read or send past the size announced in the header: if the
+            // log grows while we upload, the extra bytes would land after the
+            // frame payload and desynchronize the stream.
+            const uint64_t remaining = fileSize - sent;
+            const size_t want = remaining < buf.size()
+                                    ? static_cast<size_t>(remaining)
+                                    : buf.size();
+            in.read(buf.data(), static_cast<std::streamsize>(want));
             const std::streamsize n = in.gcount();
             if (n <= 0) { ok = false; break; }
             ok = sendAll(sock.get(), buf.data(), static_cast<size_t>(n));
@@ -249,7 +256,11 @@ private:
         std::optional<proto::FrameHeader> h;
         if (ok) {
             h = proto::decodeHeader(std::string_view(rhdr.data(), rhdr.size()));
-            ok = h.has_value() && h->payloadSize <= kMaxResultBytes;
+            // Only the two server->client types are legal here; an UploadLog
+            // reply would otherwise be saved as if it were the CSV.
+            ok = h.has_value() && h->payloadSize <= kMaxResultBytes &&
+                 (h->type == proto::MsgType::ResultCsv ||
+                  h->type == proto::MsgType::Error);
         }
         if (ok && h->payloadSize > 0) {
             body.resize(static_cast<size_t>(h->payloadSize));
@@ -267,13 +278,13 @@ private:
             finish(XferState::Failed, "server rejected upload: " + body);
             return;
         }
+        const size_t csvBytes = body.size();
         {
             std::lock_guard<std::mutex> lk(mu_);
             resultCsv_ = std::move(body);
         }
         finish(XferState::Done,
-               "result.csv received (" +
-               std::to_string(resultCsv().size()) + " bytes)");
+               "result.csv received (" + std::to_string(csvBytes) + " bytes)");
     }
 
     void dropSocket(UniqueSocket& sock) {

@@ -80,6 +80,70 @@ int main(int argc, char** argv) {
         CHECK(!p.has_value(), "negative spd -> line rejected");
     }
 
+    // ---- 1b. Regression: oversized-line accounting ----------------------
+    // A "line" that never terminates is dropped at the 1 MiB cap. It must be
+    // counted exactly once no matter how many feed() calls it spans, and the
+    // totalLines = parsed + skipped invariant must hold (an earlier version
+    // skipped the totalLines bump, underflowing parsed_lines to 2^64-1).
+    std::cout << "[oversized-line regression]\n";
+    {
+        auto summaryOf = [](const StreamParser& p) {
+            std::ostringstream os;
+            p.writeCsv(os);
+            return os.str();
+        };
+        const std::string good =
+            "[2026-06-19_22:00:00.309000][7710][30482][1885246073] "
+            "BYDA::Beam: spd[137500.000000]\n";
+
+        StreamParser sp;
+        std::string poison(5u << 20, 'X');       // 5 MiB, no newline
+        poison += '\n';
+        poison += good;
+        for (size_t i = 0; i < poison.size(); i += 65536)
+            sp.feed(std::string_view(poison).substr(i, 65536));
+        sp.finish();
+
+        CHECK(sp.stats().skippedLines == 1,
+              "5 MiB unterminated line counted once, not once per feed()");
+        CHECK(sp.stats().totalLines == 2, "totalLines counts the dropped line");
+        CHECK(summaryOf(sp).find("parsed_lines,,1") != std::string::npos,
+              "parsed_lines = 1 (no unsigned underflow)");
+
+        StreamParser only;                       // nothing but the poison
+        std::string lone(2u << 20, 'X');
+        only.feed(lone);
+        only.finish();
+        CHECK(summaryOf(only).find("parsed_lines,,0") != std::string::npos,
+              "parsed_lines = 0 when every line was dropped");
+    }
+
+    // ---- 1c. Regression: module name is a bounded identifier -------------
+    // An unescaped comma used to shift every CSV column right.
+    std::cout << "[module-name / CSV regression]\n";
+    {
+        CHECK(!LineParser::parse(
+                  "[2026-06-19_22:00:00.309000][7710][30482][1885246073] "
+                  "BYDA::Mod,With,Commas: x"),
+              "comma in module name -> line rejected");
+        CHECK(!LineParser::parse(
+                  "[2026-06-19_22:00:00.309000][7710][30482][1885246073] "
+                  "BYDA::" + std::string(200, 'M') + ": x"),
+              "over-long module name -> line rejected");
+        CHECK(LineParser::parse(
+                  "[2026-06-19_22:00:00.309000][7710][30482][1885246073] "
+                  "BYDA::Radar_Track2: x").has_value(),
+              "identifier module (digits/underscore) still accepted");
+        CHECK(!LineParser::parse(
+                  "[2026-99-19_22:00:00.309000][7710][30482][1885246073] "
+                  "BYDA::Beam: x"),
+              "month 99 -> line rejected");
+        CHECK(!LineParser::parse(
+                  "[2026-06-19_22:99:00.309000][7710][30482][1885246073] "
+                  "BYDA::Beam: x"),
+              "minute 99 -> line rejected");
+    }
+
     // ---- 2. Stream test: sample file fed in tiny chunks ----------------
     std::cout << "[StreamParser chunk-boundary test]\n";
     const char* path = (argc > 1) ? argv[1] : "sample.log";

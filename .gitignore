@@ -8,6 +8,8 @@ Test_Log.log
 
 # local run artifacts
 *.csv
+*.csv.tmp.*
+server.log
 server_run*.log
 log_server.log
 vg_*.txt

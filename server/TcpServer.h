@@ -26,9 +26,18 @@ public:
 
     bool listen(const std::string& bindAddr, int port, int backlog = 8) {
         sockaddr_in addr{};
-        uv_ip4_addr(bindAddr.c_str(), port, &addr);
-        int rc = uv_tcp_bind(&listener_,
-                             reinterpret_cast<const sockaddr*>(&addr), 0);
+        // uv_ip4_addr() leaves sin_addr zeroed on failure, which is INADDR_ANY.
+        // Ignoring the return code would silently turn a typo ("127.0.0.O") or
+        // a hostname ("localhost") into a bind on *every* interface.
+        int rc = uv_ip4_addr(bindAddr.c_str(), port, &addr);
+        if (rc != 0) {
+            log_.error("invalid bind address '" + bindAddr +
+                       "' (expected an IPv4 literal such as 0.0.0.0): " +
+                       uv_strerror(rc));
+            return false;
+        }
+        rc = uv_tcp_bind(&listener_,
+                         reinterpret_cast<const sockaddr*>(&addr), 0);
         if (rc == 0)
             rc = uv_listen(reinterpret_cast<uv_stream_t*>(&listener_),
                            backlog, &TcpServer::onConnection);
