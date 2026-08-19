@@ -22,6 +22,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -102,14 +103,16 @@ int main(int argc, char** argv) {
     addrinfo hints{};
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
-    addrinfo* res = nullptr;
-    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res) {
+    addrinfo* raw = nullptr;
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &raw) != 0 || !raw) {
         std::cerr << "cannot resolve " << host << '\n';
         return 1;
     }
+    // Owned by unique_ptr so freeaddrinfo() runs on every exit path.
+    std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> res(raw, &freeaddrinfo);
     UniqueFd fd(::socket(res->ai_family, res->ai_socktype, res->ai_protocol));
     const int rc = fd ? ::connect(fd.get(), res->ai_addr, res->ai_addrlen) : -1;
-    freeaddrinfo(res);
+    res.reset();
     if (!fd || rc != 0) {
         std::cerr << "connect failed: " << std::strerror(errno) << '\n';
         return 1;

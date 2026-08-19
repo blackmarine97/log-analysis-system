@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <deque>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -181,18 +182,23 @@ private:
         addrinfo hints{};
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
-        addrinfo* res = nullptr;
+        // getaddrinfo() hands back a heap list that must be released with
+        // freeaddrinfo(); own it through unique_ptr so every early return
+        // below frees it (RAII, no manual cleanup path to forget).
+        addrinfo* raw = nullptr;
         if (getaddrinfo(host.c_str(), std::to_string(port).c_str(),
-                        &hints, &res) != 0 || !res) {
+                        &hints, &raw) != 0 || !raw) {
             finish(XferState::Failed, "cannot resolve host " + host);
             return;
         }
+        std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> res(raw,
+                                                               &freeaddrinfo);
         UniqueSocket sock(::socket(res->ai_family, res->ai_socktype,
                                    res->ai_protocol));
         int rc = SOCKET_ERROR;
         if (sock) rc = ::connect(sock.get(), res->ai_addr,
                                  static_cast<int>(res->ai_addrlen));
-        freeaddrinfo(res);
+        res.reset();
         if (!sock || rc == SOCKET_ERROR) {
             finish(XferState::Failed,
                    "connect failed (WSA error " +
