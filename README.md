@@ -190,6 +190,29 @@ The 500 MB file is **never** held in memory, on either side:
   folds into an `__overflow__` bucket per hour, so the counts still
   reconcile with `parsed_lines`).
 
+### Buffer ownership & address stability
+
+Asynchronous I/O means someone else holds your addresses after your function
+returns — libuv keeps the `uv_write` buffer until the write callback, the
+kernel writes into the read buffer, `handle->data` points at the session for
+the handle's whole life. Every such borrow is paired with a stability
+guarantee:
+
+- Buffers handed to libuv (`response_`, `readBuf_`) are **members** of the
+  session, untouched until the completion callback, never a growing
+  container whose reallocation would move them.
+- Objects whose address libuv holds (`Session`, CsvWriter's `Job`) are
+  non-movable and owned **through `std::unique_ptr` indirection** — the
+  owning map can rehash freely, the pointee never moves — and are destroyed
+  only after libuv confirms the borrow ended (close / after-work callback).
+- `std::string_view`s into the carry buffer are consumed immediately and
+  never stored across a `feed()` (whose `append()` may reallocate).
+
+This is the reason the receive path never accumulates chunks in one
+contiguous buffer: besides the memory bound, a growing `std::vector`
+invalidates every outstanding pointer into it on reallocation — a
+use-after-free that no leak checker reports, prevented here by construction.
+
 **Measured** (full 483 MiB upload, `/usr/bin/time -v`):
 
 ```
