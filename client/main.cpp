@@ -12,19 +12,24 @@
 #include <d3d11.h>
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #include <wrl/client.h>
 
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 
+#include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "shell32.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -33,6 +38,10 @@ static ComPtr<ID3D11Device>           g_device;
 static ComPtr<ID3D11DeviceContext>    g_context;
 static ComPtr<IDXGISwapChain>         g_swapChain;
 static ComPtr<ID3D11RenderTargetView> g_rtv;
+
+// Set by WM_DROPFILES (message pump thread == UI thread; no locking needed),
+// consumed once per frame by the main loop.
+static std::wstring g_droppedFile;
 
 static void CreateRenderTarget() {
     ComPtr<ID3D11Texture2D> back;
@@ -75,6 +84,15 @@ static LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             CreateRenderTarget();
         }
         return 0;
+    case WM_DROPFILES: {
+        HDROP drop = reinterpret_cast<HDROP>(w);
+        std::vector<wchar_t> buf(MAX_PATH * 4, L'\0');
+        if (DragQueryFileW(drop, 0, buf.data(),
+                           static_cast<UINT>(buf.size())))
+            g_droppedFile = buf.data();
+        DragFinish(drop);
+        return 0;
+    }
     case WM_SYSCOMMAND:
         if ((w & 0xFFF0) == SC_KEYMENU) return 0;   // no ALT menu beep
         break;
@@ -126,6 +144,56 @@ static std::wstring pickSaveFile(HWND owner) {
     return buf.data();
 }
 
+// "482.8 MiB" / "3.2 KiB" for status strings.
+static std::string prettySize(uint64_t bytes) {
+    char buf[32];
+    if (bytes >= (1ull << 20))
+        std::snprintf(buf, sizeof(buf), "%.1f MiB",
+                      static_cast<double>(bytes) / (1 << 20));
+    else
+        std::snprintf(buf, sizeof(buf), "%.1f KiB",
+                      static_cast<double>(bytes) / (1 << 10));
+    return buf;
+}
+
+// Key figures pulled from the received result.csv for the summary panel.
+struct CsvSummary {
+    bool ok = false;
+    std::string avgSpeed, parsedLines, skippedLines;
+    std::vector<std::pair<std::string, std::string>> reasons;  // name, count
+};
+
+static CsvSummary parseSummary(const std::string& csv) {
+    CsvSummary s;
+    size_t pos = 0;
+    while (pos < csv.size()) {
+        size_t eol = csv.find('\n', pos);
+        if (eol == std::string::npos) eol = csv.size();
+        const std::string_view line(csv.data() + pos, eol - pos);
+        pos = eol + 1;
+
+        constexpr std::string_view kPrefix = "summary,";
+        if (line.substr(0, kPrefix.size()) != kPrefix) continue;
+        // summary,<name>,,<value>
+        const std::string_view rest = line.substr(kPrefix.size());
+        const size_t c1 = rest.find(',');
+        if (c1 == std::string_view::npos) continue;
+        const std::string_view name = rest.substr(0, c1);
+        const size_t c2 = rest.find(',', c1 + 1);
+        if (c2 == std::string_view::npos) continue;
+        const std::string value(rest.substr(c2 + 1));
+
+        constexpr std::string_view kSkipPrefix = "skipped_";
+        if (name == "average_speed")      { s.avgSpeed = value; s.ok = true; }
+        else if (name == "parsed_lines")  s.parsedLines = value;
+        else if (name == "skipped_lines") s.skippedLines = value;
+        else if (name.substr(0, kSkipPrefix.size()) == kSkipPrefix)
+            s.reasons.emplace_back(std::string(name.substr(kSkipPrefix.size())),
+                                   value);
+    }
+    return s;
+}
+
 // ---- application --------------------------------------------------------
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     WsaSession wsa;
@@ -136,12 +204,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                       L"LogClientClass", nullptr};
     RegisterClassExW(&wc);
     HWND hwnd = CreateWindowW(wc.lpszClassName, L"Log Analysis Client",
-                              WS_OVERLAPPEDWINDOW, 100, 100, 760, 560,
+                              WS_OVERLAPPEDWINDOW, 100, 100, 760, 600,
                               nullptr, nullptr, inst, nullptr);
     if (!CreateDeviceD3D(hwnd)) {
         UnregisterClassW(wc.lpszClassName, inst);
         return 1;
     }
+    DragAcceptFiles(hwnd, TRUE);
     ShowWindow(hwnd, SW_SHOWDEFAULT);
     UpdateWindow(hwnd);
 
@@ -153,14 +222,40 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     ImGui_ImplDX11_Init(g_device.Get(), g_context.Get());
 
     // ---- app state ------------------------------------------------------
+    using Clock = std::chrono::steady_clock;
     NetClient net;
     std::wstring logPath;                    // selected file (wide, for I/O)
     std::vector<char> pathBuf(1024, '\0');   // display copy (UTF-8)
+    std::string fileSizeStr;
     std::vector<std::string> logLines;
     std::vector<char> hostBuf(64, '\0');
     std::string("127.0.0.1").copy(hostBuf.data(), hostBuf.size() - 1);
     int port = 5555;
     bool autoScroll = true;
+    bool autoSave = true;
+
+    // transfer-rate / timing state (UI-side, derived from polled atomics)
+    XferState prevState = XferState::Idle;
+    Clock::time_point xferStart{}, lastRateT{};
+    uint64_t lastRateBytes = 0;
+    double rateBps = 0.0;          // smoothed
+    double finalElapsedSec = 0.0;
+    CsvSummary summary;
+
+    auto uiLog = [&](std::string msg) {
+        logLines.push_back(std::move(msg));
+    };
+
+    auto selectFile = [&](const std::wstring& p) {
+        logPath = p;
+        const std::string u8 = narrow(p);
+        std::fill(pathBuf.begin(), pathBuf.end(), '\0');
+        u8.copy(pathBuf.data(), pathBuf.size() - 1);
+        std::error_code ec;
+        const uint64_t sz = std::filesystem::file_size(p, ec);
+        fileSizeStr = ec ? std::string("size unknown") : prettySize(sz);
+        uiLog("selected " + u8 + " (" + fileSizeStr + ")");
+    };
 
     bool running = true;
     while (running) {
@@ -171,6 +266,63 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             if (msg.message == WM_QUIT) running = false;
         }
         if (!running) break;
+
+        const XferState st = net.state();
+        const bool busy = net.busy();
+
+        // ---- dropped file (ignored while a transfer is running) --------
+        if (!g_droppedFile.empty()) {
+            if (busy) uiLog("file drop ignored while a transfer is running");
+            else      selectFile(g_droppedFile);
+            g_droppedFile.clear();
+        }
+
+        // ---- state transitions -----------------------------------------
+        if (st != prevState) {
+            if (st == XferState::Connecting) {   // (re)started
+                xferStart = lastRateT = Clock::now();
+                lastRateBytes = 0;
+                rateBps = 0.0;
+                summary = {};
+                finalElapsedSec = 0.0;
+            }
+            if (st == XferState::Done || st == XferState::Failed ||
+                st == XferState::Cancelled) {
+                finalElapsedSec =
+                    std::chrono::duration<double>(Clock::now() - xferStart)
+                        .count();
+            }
+            if (st == XferState::Done) {
+                summary = parseSummary(net.resultCsv());
+                if (autoSave && !logPath.empty()) {
+                    const std::filesystem::path dst =
+                        std::filesystem::path(logPath).parent_path() /
+                        L"result.csv";
+                    std::ofstream out(dst,
+                                      std::ios::binary | std::ios::trunc);
+                    out << net.resultCsv();
+                    uiLog(out ? "auto-saved " + narrow(dst.wstring())
+                              : "auto-save FAILED: " + narrow(dst.wstring()));
+                }
+            }
+            prevState = st;
+        }
+
+        // ---- transfer rate (0.25 s sampling, light smoothing) ----------
+        if (busy) {
+            const auto now = Clock::now();
+            const double dt =
+                std::chrono::duration<double>(now - lastRateT).count();
+            if (dt >= 0.25) {
+                const uint64_t sent = net.bytesSent();
+                const double inst =
+                    static_cast<double>(sent - lastRateBytes) / dt;
+                rateBps = rateBps == 0.0 ? inst
+                                         : rateBps * 0.6 + inst * 0.4;
+                lastRateBytes = sent;
+                lastRateT = now;
+            }
+        }
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -184,21 +336,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                      ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoSavedSettings);
 
-        const XferState st = net.state();
-        const bool busy = net.busy();
-
         // -- connection row
         ImGui::TextUnformatted("Server");
         ImGui::SameLine(90);
         ImGui::SetNextItemWidth(160);
+        ImGui::BeginDisabled(busy);
         ImGui::InputText("##host", hostBuf.data(), hostBuf.size());
         ImGui::SameLine();
         ImGui::TextUnformatted("Port");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(90);
         ImGui::InputInt("##port", &port, 0);
+        ImGui::EndDisabled();
 
-        // -- file row
+        // -- file row (drag & drop onto the window also works)
         ImGui::TextUnformatted("Log file");
         ImGui::SameLine(90);
         ImGui::SetNextItemWidth(-110);
@@ -208,14 +359,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         ImGui::BeginDisabled(busy);
         if (ImGui::Button("Browse...", ImVec2(100, 0))) {
             std::wstring p = pickOpenFile(hwnd);
-            if (!p.empty()) {
-                logPath = p;
-                const std::string u8 = narrow(p);
-                std::fill(pathBuf.begin(), pathBuf.end(), '\0');
-                u8.copy(pathBuf.data(), pathBuf.size() - 1);
-            }
+            if (!p.empty()) selectFile(p);
         }
         ImGui::EndDisabled();
+        if (!fileSizeStr.empty())
+            ImGui::TextDisabled("Size: %s", fileSizeStr.c_str());
+        else
+            ImGui::TextDisabled("Tip: drag & drop a log file anywhere on "
+                                "this window");
 
         ImGui::Spacing();
 
@@ -235,13 +386,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             if (!p.empty()) {
                 std::ofstream out(p, std::ios::binary | std::ios::trunc);
                 out << net.resultCsv();
+                uiLog((out ? "saved " : "save FAILED: ") + narrow(p));
             }
         }
         ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::Checkbox("Auto-save next to log", &autoSave);
 
         // -- progress
         ImGui::Spacing();
-        char overlay[64];
+        char overlay[96];
         std::snprintf(overlay, sizeof(overlay), "%.1f%%  (%llu / %llu MiB)",
                       static_cast<double>(net.progress()) * 100.0,
                       static_cast<unsigned long long>(net.bytesSent() >> 20),
@@ -249,16 +403,59 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         ImGui::ProgressBar(net.progress(), ImVec2(-1, 0),
                            net.bytesTotal() ? overlay : "");
 
-        const char* stateName =
-            st == XferState::Idle            ? "idle"
-            : st == XferState::Connecting    ? "connecting"
-            : st == XferState::Uploading     ? "uploading"
-            : st == XferState::WaitingResult ? "analyzing on server"
-            : st == XferState::Done          ? "done"
-            : st == XferState::Cancelled     ? "cancelled"
-                                             : "failed";
-        ImGui::Text("State: %s", stateName);
+        // -- speed / elapsed / ETA line
+        {
+            const double elapsed =
+                busy ? std::chrono::duration<double>(Clock::now() - xferStart)
+                           .count()
+                     : finalElapsedSec;
+            std::string line;
+            char buf[64];
+            if (st == XferState::Uploading && rateBps > 1.0) {
+                std::snprintf(buf, sizeof(buf), "   Speed: %.1f MB/s",
+                              rateBps / 1e6);
+                line += buf;
+                const uint64_t remain = net.bytesTotal() - net.bytesSent();
+                if (remain > 0) {
+                    std::snprintf(buf, sizeof(buf), "   ETA: %.1f s",
+                                  static_cast<double>(remain) / rateBps);
+                    line += buf;
+                }
+            }
+            if (elapsed > 0.0) {
+                std::snprintf(buf, sizeof(buf), "   Elapsed: %.1f s",
+                              elapsed);
+                line += buf;
+            }
+            const char* stateName =
+                st == XferState::Idle            ? "idle"
+                : st == XferState::Connecting    ? "connecting"
+                : st == XferState::Uploading     ? "uploading"
+                : st == XferState::WaitingResult ? "analyzing on server"
+                : st == XferState::Done          ? "done"
+                : st == XferState::Cancelled     ? "cancelled"
+                                                 : "failed";
+            ImGui::Text("State: %s%s", stateName, line.c_str());
+        }
         ImGui::TextWrapped("Status: %s", net.status().c_str());
+
+        // -- analysis result panel (after a successful run)
+        if (st == XferState::Done && summary.ok) {
+            ImGui::Spacing();
+            ImGui::SeparatorText("Analysis result");
+            ImGui::Text("Average speed: %s", summary.avgSpeed.c_str());
+            ImGui::Text("Parsed lines: %s    Skipped lines: %s",
+                        summary.parsedLines.c_str(),
+                        summary.skippedLines.c_str());
+            if (!summary.reasons.empty()) {
+                std::string breakdown;
+                for (const auto& [name, count] : summary.reasons) {
+                    if (!breakdown.empty()) breakdown += ",  ";
+                    breakdown += name + ": " + count;
+                }
+                ImGui::TextWrapped("Skip breakdown: %s", breakdown.c_str());
+            }
+        }
 
         // -- log pane
         ImGui::Spacing();

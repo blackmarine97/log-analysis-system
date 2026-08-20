@@ -79,9 +79,15 @@ cmake --build build-client --config Release
 # -> build-client\Release\log_client.exe  (statically linked CRT, single exe)
 ```
 
-Usage: pick the log file with **Browse**, press **Upload**, watch the
-progress bar, then **Save result.csv** once the state reaches *done*.
-**Cancel** aborts an in-flight transfer safely.
+Usage: pick the log file with **Browse** (or drag & drop it onto the
+window), press **Upload**, and watch the progress bar with live transfer
+speed / ETA / elapsed time. When the state reaches *done* the client shows
+an **analysis summary panel** (average speed, parsed/skipped lines with the
+per-reason breakdown) parsed from the received CSV; the file is auto-saved
+next to the selected log (toggleable) and **Save result.csv...** stores a
+copy anywhere else. **Cancel** aborts an in-flight transfer safely, and
+socket failures surface as human-readable messages
+(`connect failed: server not reachable - is it running? (WSA 10061)`).
 
 ## Network Architecture
 

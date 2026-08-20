@@ -134,6 +134,26 @@ private:
     static constexpr DWORD  kIoTimeoutMs = 30 * 1000;
     static constexpr uint64_t kMaxResultBytes = 256ull << 20;
 
+    // Human-readable text for the WSA errors a user can realistically hit;
+    // the raw code is still appended so the log stays diagnosable.
+    static std::string wsaText(int e) {
+        switch (e) {
+            case 0:               return "malformed or unexpected server response";
+            case WSAECONNREFUSED: return "server not reachable - is it running?";
+            case WSAETIMEDOUT:    return "timed out - server not responding";
+            case WSAECONNRESET:   return "connection reset by the server";
+            case WSAECONNABORTED: return "connection dropped (I/O timeout)";
+            case WSAEHOSTUNREACH: return "host unreachable - check the address";
+            case WSAENETUNREACH:  return "network unreachable";
+            case WSAENETDOWN:     return "network is down";
+            default:              return "network error";
+        }
+    }
+    static std::string wsaMsg(const char* what, int e) {
+        return std::string(what) + ": " + wsaText(e) +
+               " (WSA " + std::to_string(e) + ')';
+    }
+
     void setStatus(std::string s) {
         std::lock_guard<std::mutex> lk(mu_);
         status_ = std::move(s);
@@ -201,8 +221,7 @@ private:
         res.reset();
         if (!sock || rc == SOCKET_ERROR) {
             finish(XferState::Failed,
-                   "connect failed (WSA error " +
-                   std::to_string(WSAGetLastError()) + ')');
+                   wsaMsg("connect failed", WSAGetLastError()));
             return;
         }
         setsockopt(sock.get(), SOL_SOCKET, SO_SNDTIMEO,
@@ -244,11 +263,13 @@ private:
             }
         }
         if (!ok) {
+            // Capture the error before dropSocket(): closesocket() may
+            // overwrite the thread's last-error value.
+            const int err = WSAGetLastError();
             dropSocket(sock);
             finish(cancelFlag_ ? XferState::Cancelled : XferState::Failed,
                    cancelFlag_ ? "upload cancelled"
-                               : "upload failed (connection lost, WSA error " +
-                                 std::to_string(WSAGetLastError()) + ')');
+                               : wsaMsg("upload failed", err));
             return;
         }
 
@@ -272,12 +293,13 @@ private:
             body.resize(static_cast<size_t>(h->payloadSize));
             ok = recvAll(sock.get(), body.data(), body.size());
         }
+        const int recvErr = ok ? 0 : WSAGetLastError();
         dropSocket(sock);
 
         if (!ok) {
             finish(cancelFlag_ ? XferState::Cancelled : XferState::Failed,
                    cancelFlag_ ? "cancelled while waiting for result"
-                               : "failed to receive result from server");
+                               : wsaMsg("failed to receive result", recvErr));
             return;
         }
         if (h->type == proto::MsgType::Error) {
