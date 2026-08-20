@@ -27,17 +27,23 @@ else()
 endif()
 
 set(COMMON_WARNINGS -Wall -Wextra -Wpedantic)
+find_package(Threads REQUIRED)   # Logger owns a std::thread
 
 add_executable(log_server main.cpp)
 target_compile_options(log_server PRIVATE ${COMMON_WARNINGS})
 target_include_directories(log_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..)      # for common/Protocol.h
-target_link_libraries(log_server PRIVATE libuv_dep)
+target_link_libraries(log_server PRIVATE libuv_dep Threads::Threads)
 
 add_executable(parser_test tests/parser_test.cpp)
 target_compile_options(parser_test PRIVATE ${COMMON_WARNINGS})
 target_include_directories(parser_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(logger_test tests/logger_test.cpp)
+target_compile_options(logger_test PRIVATE ${COMMON_WARNINGS})
+target_include_directories(logger_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(logger_test PRIVATE Threads::Threads)
 
 add_executable(test_client tests/test_client.cpp)
 target_compile_options(test_client PRIVATE ${COMMON_WARNINGS})
@@ -47,3 +53,4 @@ target_include_directories(test_client PRIVATE
 enable_testing()
 add_test(NAME parser_unit COMMAND parser_test
          ${CMAKE_CURRENT_SOURCE_DIR}/../Test_Log.log)
+add_test(NAME logger_unit COMMAND logger_test)

@@ -8,6 +8,7 @@
 // Defaults: port 5555, bind 0.0.0.0, foreground, log to stderr,
 //           server-side CSV copy to ./result.csv.
 
+#include "CsvWriter.h"
 #include "Logger.h"
 #include "TcpServer.h"
 
@@ -76,10 +77,14 @@ int main(int argc, char** argv) {
     uv_loop_t loop;
     uv_loop_init(&loop);
 
+    // Declaration order == reverse destruction order, and that order matters:
+    // Logger (own writer thread) must outlive everything that logs; CsvWriter
+    // must outlive uv_run() so its thread-pool jobs can report back.
     Logger log(opt.logPath);
     log.info("log_server starting (pid " + std::to_string(getpid()) + ')');
 
-    TcpServer server(&loop, log, opt.csvPath);
+    CsvWriter csvWriter(&loop, log, opt.csvPath);
+    TcpServer server(&loop, log, csvWriter);
     if (!server.listen(opt.bindAddr, opt.port)) {
         uv_loop_close(&loop);
         return 1;

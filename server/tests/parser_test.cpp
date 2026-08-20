@@ -16,75 +16,123 @@ static int gFailures = 0;
         else      { std::cout << "  FAIL  " << msg << "\n"; ++gFailures; }   \
     } while (0)
 
+static constexpr const char* kHdr =
+    "[2026-06-19_22:00:00.309000][7710][30482][1885246073] ";
+
+// Expect a rejection with a specific reason.
+static void expectSkip(std::string_view line, SkipReason why, const char* msg) {
+    const ParseResult r = LineParser::parse(line);
+    const bool ok = !r.valid && r.reason == why;
+    CHECK(ok, std::string(msg) + (ok ? "" :
+          "  (got " + std::string(toString(r.reason)) + ")"));
+}
+
 int main(int argc, char** argv) {
     // ---- 1. Unit checks on single lines --------------------------------
-    std::cout << "[LineParser unit checks]\n";
+    std::cout << "[LineParser: valid lines]\n";
     {
-        auto p = LineParser::parse(
-            "[2026-06-19_22:00:00.309000][7710][30482][1885246073] "
+        auto r = LineParser::parse(std::string(kHdr) +
             "BYDA::BeamSteerCtrlUnitImpl: unitAddr[4181], spd[137500.000000], "
             "advDelta[62750.000000]");
-        CHECK(p.has_value(), "valid spd line parses");
-        CHECK(p && p->module == "BeamSteerCtrlUnitImpl", "module extracted");
-        CHECK(p && p->dateHour == "2026-06-19 22", "dateHour bucket");
-        CHECK(p && p->speed && std::abs(*p->speed - 137500.0) < 1e-9,
+        CHECK(r.valid, "valid spd line parses");
+        CHECK(r.valid && r.line.module == "BeamSteerCtrlUnitImpl", "module extracted");
+        CHECK(r.valid && r.line.dateHour == "2026-06-19 22", "dateHour bucket");
+        CHECK(r.valid && r.line.speed && std::abs(*r.line.speed - 137500.0) < 1e-9,
               "spd value = 137500 (advDelta not confused)");
     }
     {
-        auto p = LineParser::parse(
-            "[2026-06-19_22:00:00.045000][7710][30482][1885246073] "
+        auto r = LineParser::parse(std::string(kHdr) +
             "BYDA::RadarTrackNodeState: node_state_synced: nodeUID[47], "
             "rfLane[3], lockState[1->0]");
-        CHECK(p && !p->speed, "non-spd line: speed == nullopt");
-        CHECK(p && p->module == "RadarTrackNodeState", "module w/ nested colons");
+        CHECK(r.valid && !r.line.speed, "non-spd line: speed == nullopt");
+        CHECK(r.valid && r.line.module == "RadarTrackNodeState", "module w/ nested colons");
     }
-    // Poison variants (each must be rejected, never crash):
-    const char* poison[] = {
-        "",                                                        // empty
-        "garbage without any structure",
-        "[2026-06-19_22:00:00.045000][7710][30482]"                // 2 fields only
-        " BYDA::RadarTrackNodeState: x",
-        "[2026-06-19_25:00:00.045000][7710][30482][1885246073]"    // hour 25
-        " BYDA::X: y",
-        "[2026-06-19_22:00:00.045000][7710][30482][1885246073] NOPE::Mod: x",
-        "[2026-06-19_22:00:00.045000][7710][3O482][1885246073]"    // letter O
-        " BYDA::X: y",
-        "[2026-06-19_22:00:00.045000][7710][30482][1885246073] BYDA::: x",
-        "[2026-06-19_22:00:00.04",                                 // truncated
-        "[2026-06-19_22:00:00.045000][7710][30482][1885246073] "
-        "BYDA::Beam: spd[not_a_number]",                           // corrupt spd
-    };
-    int rejected = 0;
-    for (auto* s : poison)
-        if (!LineParser::parse(s)) ++rejected;
-    CHECK(rejected == 9, "all 9 poison lines rejected");
+    // Every real module's payload shape must pass (from the sample file).
+    CHECK(LineParser::parse(std::string(kHdr) +
+          "BYDA::SectorSchedulerRTS: scan started: RT_SWEEP jobID[12], pattern[SW3], gatedFlag[1]").valid,
+          "pattern[SW3]: unknown key with alphabetic value accepted");
+    CHECK(LineParser::parse(std::string(kHdr) +
+          "BYDA::DetectionTaskRunner: Sector Command: jobID[12], command[RUN], sectorID[3], bearing[270]").valid,
+          "command[RUN]: unknown key with alphabetic value accepted");
+    CHECK(LineParser::parse(std::string(kHdr) +
+          "BYDA::AntennaProfileSpec: applyElement: sectorID[3], element[1][2][3]").valid,
+          "element[1][2][3]: consecutive brackets accepted");
+    CHECK(LineParser::parse(std::string(kHdr) + "BYDA::Radar_Track2: x").valid,
+          "identifier module (digits/underscore) accepted");
 
-    // Real poison from Test_Log.log:
+    std::cout << "[LineParser: structural rejections (Level 1)]\n";
+    expectSkip("", SkipReason::EmptyLine, "empty line");
+    expectSkip("garbage without any structure", SkipReason::InvalidTimestamp,
+               "no structure at all");
+    expectSkip("[2026-06-19_22:00:00.04", SkipReason::InvalidTimestamp, "truncated");
+    expectSkip("2026-06-19_22:20:00.111111][7710][30482][1885246073] BYDA::HeadBraceLoss: raw[9]",
+               SkipReason::InvalidTimestamp, "HeadBraceLoss: missing opening bracket");
+    expectSkip("[2026-06-19_25:00:00.045000][7710][30482][1885246073] BYDA::X: y",
+               SkipReason::InvalidTimestamp, "hour 25");
+    expectSkip("[2026-99-19_22:00:00.309000][7710][30482][1885246073] BYDA::Beam: x",
+               SkipReason::InvalidTimestamp, "month 99");
+    expectSkip("[2026-06-19_22:99:00.309000][7710][30482][1885246073] BYDA::Beam: x",
+               SkipReason::InvalidTimestamp, "minute 99");
+    expectSkip("[2026-06-19_22:00:00.045000][7710][30482] BYDA::RadarTrackNodeState: x",
+               SkipReason::InvalidHeaderField, "only 2 header fields");
+    expectSkip("[2026-06-19_22:00:00.045000][7710][3O482][1885246073] BYDA::X: y",
+               SkipReason::InvalidHeaderField, "letter O in header field");
+    expectSkip("[2026-06-19_22:15:00.000000] !@#$RAW_FRAME_DECODE_FAILURE_GARBAGE_OCTETS%^&*()",
+               SkipReason::InvalidHeaderField, "garbage after timestamp");
+    expectSkip("[2026-06-19_22:05:00.123456][7710][30482][1885246073 BYDA::OpenBraceLeak: rfLane[3]",
+               SkipReason::InvalidHeaderField, "OpenBraceLeak: unclosed header field");
+    expectSkip(std::string(kHdr) + "NOPE::Mod: x", SkipReason::InvalidModule, "wrong prefix");
+    expectSkip(std::string(kHdr) + "BYDA::: x", SkipReason::InvalidModule, "empty module");
+    expectSkip(std::string(kHdr) + "BYDA::Mod,With,Commas: x", SkipReason::InvalidModule,
+               "comma in module name");
+    expectSkip(std::string(kHdr) + "BYDA::" + std::string(200, 'M') + ": x",
+               SkipReason::InvalidModule, "over-long module name");
+    expectSkip(std::string(kHdr) + "BYDA::Beam: unitAddr[4181], spd[1.0",
+               SkipReason::UnbalancedBrackets, "unterminated bracket in payload");
+    expectSkip(std::string(kHdr) + "BYDA::Beam: unitAddr 4181], spd[1.0]",
+               SkipReason::UnbalancedBrackets, "stray ']' in payload");
+
+    std::cout << "[LineParser: semantic rejections (Level 2)]\n";
+    expectSkip(std::string(kHdr) + "BYDA::CorruptPayload: nodeUID[NONE], rfLane[X]",
+               SkipReason::InvalidNodeUid, "CorruptPayload: nodeUID[NONE] (first bad key wins)");
+    expectSkip(std::string(kHdr) + "BYDA::RadarTrackNodeState: nodeUID[47], rfLane[X]",
+               SkipReason::InvalidRfLane, "rfLane[X]");
+    expectSkip(std::string(kHdr) + "BYDA::RadarTrackNodeState: nodeUID[47], rfLane[3], lockState[open]",
+               SkipReason::InvalidLockState, "lockState[open]");
+    expectSkip(std::string(kHdr) + "BYDA::RadarTrackNodeState: nodeUID[47], rfLane[3], lockState[1->]",
+               SkipReason::InvalidLockState, "lockState[1->]");
+    CHECK(LineParser::parse(std::string(kHdr) + "BYDA::X: myrfLane[X], rfLane[3]").valid,
+          "myrfLane[X]: key match is word-bounded (not rfLane)");
+
+    std::cout << "[LineParser: speed rejections (Level 3)]\n";
+    expectSkip(std::string(kHdr) + "BYDA::BeyondLimit: spd[888888888888888888888.88]",
+               SkipReason::InvalidSpeed, "BeyondLimit spd[8.9e20] -> range");
+    expectSkip(std::string(kHdr) + "BYDA::Beam: spd[not_a_number]",
+               SkipReason::InvalidSpeed, "spd[not_a_number]");
+    expectSkip(std::string(kHdr) + "BYDA::Beam: spd[-5.0]",
+               SkipReason::InvalidSpeed, "negative spd");
+    expectSkip(std::string(kHdr) + "BYDA::Beam: spd[inf]",
+               SkipReason::InvalidSpeed, "spd[inf] (non-finite)");
+    CHECK(LineParser::parse(std::string(kHdr) + "BYDA::Beam: wspd[abc], spd[1.5]").valid,
+          "wspd[abc] ignored (word boundary), spd[1.5] accepted");
     {
-        auto p = LineParser::parse(
-            "[2026-06-19_22:25:00.999999][7710][30482][1885246073] "
-            "BYDA::BeyondLimit: spd[888888888888888888888.88]");
-        CHECK(!p.has_value(), "BeyondLimit spd[8.9e20] -> line rejected (range)");
-    }
-    {
-        auto p = LineParser::parse(
-            "[2026-06-19_22:10:00.654321][7710][30482][1885246073] "
-            "BYDA::CorruptPayload: nodeUID[NONE], rfLane[X]");
-        CHECK(p && !p->speed && p->module == "CorruptPayload",
-              "CorruptPayload (no spd) -> counted, no speed");
-    }
-    {
-        auto p = LineParser::parse(
-            "[2026-06-19_22:00:00.309000][7710][30482][1885246073] "
-            "BYDA::Beam: spd[-5.0]");
-        CHECK(!p.has_value(), "negative spd -> line rejected");
+        // Pipeline order: a structural fault is reported even if spd is also bad.
+        expectSkip(std::string(kHdr) + "BYDA::Beam: spd[9e20], rfLane[X",
+                   SkipReason::UnbalancedBrackets, "structural reason wins over semantic/spd");
+        expectSkip(std::string(kHdr) + "BYDA::Beam: spd[9e20], rfLane[X]",
+                   SkipReason::InvalidRfLane, "semantic reason wins over spd");
+        // Structural wins even when the semantic fault is further LEFT: the
+        // semantic error is remembered, not returned, until the scan ends.
+        expectSkip(std::string(kHdr) + "BYDA::Beam: rfLane[X], spd[1.0",
+                   SkipReason::UnbalancedBrackets, "structural wins over earlier semantic fault");
+        expectSkip(std::string(kHdr) + "BYDA::Beam: rfLane[X], nodeUID[NONE]",
+                   SkipReason::InvalidRfLane, "first (leftmost) semantic fault is reported");
     }
 
     // ---- 1b. Regression: oversized-line accounting ----------------------
     // A "line" that never terminates is dropped at the 1 MiB cap. It must be
     // counted exactly once no matter how many feed() calls it spans, and the
-    // totalLines = parsed + skipped invariant must hold (an earlier version
-    // skipped the totalLines bump, underflowing parsed_lines to 2^64-1).
+    // totalLines = parsed + skipped invariant must hold.
     std::cout << "[oversized-line regression]\n";
     {
         auto summaryOf = [](const StreamParser& p) {
@@ -92,9 +140,7 @@ int main(int argc, char** argv) {
             p.writeCsv(os);
             return os.str();
         };
-        const std::string good =
-            "[2026-06-19_22:00:00.309000][7710][30482][1885246073] "
-            "BYDA::Beam: spd[137500.000000]\n";
+        const std::string good = std::string(kHdr) + "BYDA::Beam: spd[137500.000000]\n";
 
         StreamParser sp;
         std::string poison(5u << 20, 'X');       // 5 MiB, no newline
@@ -106,9 +152,13 @@ int main(int argc, char** argv) {
 
         CHECK(sp.stats().skippedLines == 1,
               "5 MiB unterminated line counted once, not once per feed()");
+        CHECK(sp.stats().skippedByReason[size_t(SkipReason::OversizedLine)] == 1,
+              "counted under OversizedLine");
         CHECK(sp.stats().totalLines == 2, "totalLines counts the dropped line");
         CHECK(summaryOf(sp).find("parsed_lines,,1") != std::string::npos,
               "parsed_lines = 1 (no unsigned underflow)");
+        CHECK(summaryOf(sp).find("skipped_OversizedLine,,1") != std::string::npos,
+              "per-reason summary row emitted");
 
         StreamParser only;                       // nothing but the poison
         std::string lone(2u << 20, 'X');
@@ -116,32 +166,6 @@ int main(int argc, char** argv) {
         only.finish();
         CHECK(summaryOf(only).find("parsed_lines,,0") != std::string::npos,
               "parsed_lines = 0 when every line was dropped");
-    }
-
-    // ---- 1c. Regression: module name is a bounded identifier -------------
-    // An unescaped comma used to shift every CSV column right.
-    std::cout << "[module-name / CSV regression]\n";
-    {
-        CHECK(!LineParser::parse(
-                  "[2026-06-19_22:00:00.309000][7710][30482][1885246073] "
-                  "BYDA::Mod,With,Commas: x"),
-              "comma in module name -> line rejected");
-        CHECK(!LineParser::parse(
-                  "[2026-06-19_22:00:00.309000][7710][30482][1885246073] "
-                  "BYDA::" + std::string(200, 'M') + ": x"),
-              "over-long module name -> line rejected");
-        CHECK(LineParser::parse(
-                  "[2026-06-19_22:00:00.309000][7710][30482][1885246073] "
-                  "BYDA::Radar_Track2: x").has_value(),
-              "identifier module (digits/underscore) still accepted");
-        CHECK(!LineParser::parse(
-                  "[2026-99-19_22:00:00.309000][7710][30482][1885246073] "
-                  "BYDA::Beam: x"),
-              "month 99 -> line rejected");
-        CHECK(!LineParser::parse(
-                  "[2026-06-19_22:99:00.309000][7710][30482][1885246073] "
-                  "BYDA::Beam: x"),
-              "minute 99 -> line rejected");
     }
 
     // ---- 2. Stream test: sample file fed in tiny chunks ----------------
@@ -154,8 +178,8 @@ int main(int argc, char** argv) {
     const std::string all = ss.str();
 
     // Feed with a pathological chunk size (7 bytes) to force partial lines.
-    StreamParser sp([](uint64_t no, std::string_view line) {
-        std::cout << "  [skip] line " << no << ": "
+    StreamParser sp([](uint64_t no, SkipReason why, std::string_view line) {
+        std::cout << "  [skip] line " << no << " [" << toString(why) << "]: "
                   << line.substr(0, 60) << "\n";
     });
     for (size_t i = 0; i < all.size(); i += 7)
@@ -173,8 +197,22 @@ int main(int argc, char** argv) {
     ref.finish();
     CHECK(st.moduleCounts == ref.stats().moduleCounts &&
           st.speedCount == ref.stats().speedCount &&
-          st.skippedLines == ref.stats().skippedLines,
+          st.skippedLines == ref.stats().skippedLines &&
+          st.skippedByReason == ref.stats().skippedByReason,
           "7-byte chunking == single-chunk (boundary handling correct)");
+
+    // Known answer for the assignment's sample file (skip if another log).
+    if (st.totalLines == 3483528) {
+        std::cout << "[known answer: Test_Log.log]\n";
+        CHECK(st.skippedLines == 26, "26 corrupted lines skipped");
+        CHECK(st.skippedByReason[size_t(SkipReason::InvalidTimestamp)]   == 2, "  2 InvalidTimestamp (HeadBraceLoss)");
+        CHECK(st.skippedByReason[size_t(SkipReason::InvalidHeaderField)] == 11, " 11 InvalidHeaderField (5 garbage + 6 OpenBraceLeak)");
+        CHECK(st.skippedByReason[size_t(SkipReason::InvalidNodeUid)]     == 7, "  7 InvalidNodeUid (CorruptPayload)");
+        CHECK(st.skippedByReason[size_t(SkipReason::InvalidSpeed)]       == 6, "  6 InvalidSpeed (BeyondLimit)");
+        CHECK(st.moduleCounts.count({"2026-06-19 22", "CorruptPayload"}) == 0,
+              "CorruptPayload no longer appears as a module");
+        CHECK(st.speedCount == 580661, "580661 speed samples");
+    }
 
     // ---- 3. CSV output --------------------------------------------------
     std::cout << "[result.csv]\n";

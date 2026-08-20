@@ -11,6 +11,7 @@ endif()
 
 # The Linux server (and its tests) build here. The Windows client has its
 # own CMake project under client/ because it is built on a different host.
+enable_testing()   # must be in the top-level list for `ctest` to find tests
 if(UNIX)
     add_subdirectory(server)
 endif()

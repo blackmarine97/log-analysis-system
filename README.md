@@ -5,7 +5,8 @@ GUI client to a Linux server over TCP. The server parses the stream **while
 receiving it**, aggregates statistics, and returns `result.csv` to the client.
 
 - **Client**: C++17, Dear ImGui (Win32 + DirectX 11), worker-thread I/O
-- **Server**: C++17, libuv event loop, single process
+- **Server**: C++17, libuv event loop (single loop thread) + a dedicated
+  log-writer thread + libuv's thread pool for the result.csv file write
 - **Protocol**: TCP with a 16-byte length-prefixed framing header
 
 ## Repository Layout
@@ -18,8 +19,10 @@ receiving it**, aggregates statistics, and returns `result.csv` to the client.
 │   ├── StreamParser.h #   chunk reassembly + statistics + CSV
 │   ├── Session.h      #   per-connection state machine
 │   ├── TcpServer.h    #   listener, owns sessions via unique_ptr
-│   ├── Logger.h, main.cpp
-│   └── tests/         #   parser unit test + CLI test client
+│   ├── Logger.h       #   async logger: bounded queue + writer thread
+│   ├── CsvWriter.h    #   result.csv copy via uv_queue_work (thread pool)
+│   ├── main.cpp
+│   └── tests/         #   parser + logger unit tests, CLI test client
 ├── client/            # Windows GUI client (Dear ImGui + DX11)
 │   ├── NetClient.h    #   worker-thread uploader (WinSock, RAII)
 │   └── main.cpp
@@ -62,6 +65,7 @@ first — any log in the same format works:
 
 ```bash
 ./build/server/parser_test Test_Log.log
+./build/server/logger_test
 ```
 
 ### Client (Windows)
@@ -105,12 +109,48 @@ sequenceDiagram
     Note over C: user saves result.csv via dialog
 ```
 
-- The server is a single-threaded libuv event loop; each connection is a
-  `Session` object owned by `TcpServer` through `std::unique_ptr` and
-  destroyed only after libuv confirms the handle closed — use-after-free is
-  impossible by construction.
+- All socket handling and parsing runs on one libuv loop thread; each
+  connection is a `Session` object owned by `TcpServer` through
+  `std::unique_ptr` and destroyed only after libuv confirms the handle closed
+  — use-after-free is impossible by construction.
 - The client performs all socket I/O on a worker `std::thread`; the UI
   thread only polls atomics, so the window never freezes during the upload.
+
+### Threading model (hybrid: one loop, blocking I/O moved off it)
+
+The rule is "the event loop never waits on disk". Parsing stays on the loop
+(≈80 µs per 64 KiB chunk, 0.6 s for the whole file — far below the point
+where a worker would pay for itself, and it keeps session lifetime trivial).
+The two things that *can* block are delegated:
+
+| work                    | where it runs                         | mechanism                                  |
+|-------------------------|---------------------------------------|--------------------------------------------|
+| socket I/O + parsing    | loop thread                           | libuv callbacks → `StreamParser::feed()`   |
+| log file writes         | dedicated writer thread (`Logger`)    | producer/consumer: bounded queue (50k lines), writer drains in batches every 5 ms, one flush per batch |
+| result.csv copy         | libuv thread pool (`CsvWriter`)       | `uv_queue_work`; completion logged back on the loop |
+
+`Logger` is created before and destroyed after everything else in `main()`,
+so its destructor drains the queue and joins the writer — nothing queued is
+lost on `SIGTERM`. If the queue ever fills (disk stall), the producer blocks
+rather than dropping lines. `CsvWriter` owns each in-flight job via
+`std::unique_ptr` and erases it in the after-work callback, the same pattern
+`TcpServer` uses for sessions; `uv_run()` does not return while a job is
+pending, so no job outlives its owner.
+
+Why not wake the writer per log line? Measured: a `notify_one()` per line
+puts a futex syscall on the loop thread and was *slower* than the old
+synchronous write (1.4 s vs 0.87 s per upload on a 5 %-corrupt file). The
+5 ms polling writer removes that cost entirely:
+
+```
+500 MB upload, 5 % of lines corrupted (174k WARN lines per upload), loopback:
+  synchronous per-line flush (old):  0.84 s/upload   peak RSS 4.4 MB
+  async logger (this version):       0.71 s/upload   peak RSS 5.1 MB
+500 MB clean file (19 WARN lines):    0.60 s either way
+```
+
+Checked with ThreadSanitizer (0 reports) and valgrind (0 bytes in use at
+exit, 0 errors) on an upload + mid-transfer abort + SIGTERM scenario.
 
 ### Robustness on disconnect
 
@@ -147,7 +187,8 @@ The 500 MB file is **never** held in memory, on either side:
 **Measured** (full 483 MiB upload, `/usr/bin/time -v`):
 
 ```
-Maximum resident set size: 4,456 KB   (limit: 50 MB -> 8.9% used)
+Maximum resident set size: 4,496 KB   (limit: 50 MB -> 9% used)
+  with 5 % of lines corrupted (174k WARN lines queued for the log writer): 5,076 KB
 ```
 
 **Leak check** (valgrind, full scenario: upload + mid-transfer abort +
@@ -175,39 +216,70 @@ rule; they are fetched into the build tree, never vendored into the sources.
 
 ## Corrupted ("Poison") Data Handling
 
-`LineParser::parse()` is stateless and non-throwing: it returns
-`std::optional<ParsedLine>` and rejects a line on **any** structural
-violation (two-stage validation):
+`LineParser::parse()` is stateless and non-throwing. It returns a
+`ParseResult { valid, SkipReason reason, ParsedLine line }` and runs a
+three-level pipeline — **structural → semantic → speed → statistics** —
+where the first failing check decides the `SkipReason`:
 
-1. **Structural**: fixed-width timestamp with separator/digit checks and
-   calendar range checks (month 1-12, day 1-31, hour 0-23, minute/second
-   0-59), three numeric `[n]` fields, and a `BYDA::<Module>:` prefix whose
-   module name must be an identifier (`[A-Za-z0-9_]`, <= 128 chars) — an
-   unexpected character there is corruption, and would otherwise become an
-   unescapable CSV key.
-2. **Semantic**: if a `spd[...]` field is present but unparseable,
-   unterminated, negative, or physically implausible (`>= 1e9`), the whole
-   line is treated as corrupt — poison values can never contaminate the
-   average. (Normal values sit around `1.4e5`; the injected poison was
-   `8.9e20`, which would have dominated the mean by 15 orders of magnitude.)
+1. **Level 1 — structural integrity** (always checked): fixed-width timestamp
+   with separator/digit checks and calendar ranges (month 1-12, day 1-31,
+   hour 0-23, minute/second 0-59); three numeric `[n]` header fields; a
+   `BYDA::<Module>:` prefix whose module name is an identifier
+   (`[A-Za-z0-9_]`, <= 128 chars); and payload brackets that pair up (every
+   `[` closed by the next `]`, no stray `]`, no nesting).
+2. **Level 2 — semantic validation of known keys only.** The payload is a
+   list of `key[value]` fields whose format differs per module, so the rule
+   is: validate the *shape* of keys we know, never touch keys we don't.
+   Known keys and their shapes were derived from the sample data:
 
-Malformed lines are counted, logged (line number + first 120 chars), and
-parsing continues to the end of the stream. Chunk boundaries are handled by
-the carry buffer, verified by a test that feeds the whole file in 7-byte
-chunks and requires results identical to a single-chunk run.
+   | key         | required shape   | example        |
+   |-------------|------------------|----------------|
+   | `nodeUID`   | integer          | `nodeUID[47]`  |
+   | `rfLane`    | integer          | `rfLane[3]`    |
+   | `lockState` | `int->int`       | `lockState[1->0]` |
+   | `spd`       | see Level 3      | `spd[137500.000000]` |
+
+   Unknown keys such as `pattern[SW3]`, `command[RUN]` or
+   `element[1][2][3]` are legitimate and pass untouched — a naive
+   "bracket values must be numeric" rule would have rejected ~100k valid
+   lines. Key matching is word-bounded (`wspd[` is not `spd[`).
+3. **Level 3 — speed**: if `spd[...]` is present it must parse as a finite
+   number in `[0, 1e9)`; otherwise the whole line is corrupt so poison values
+   can never contaminate the average. (Normal values sit around `1.4e5`; the
+   injected poison was `8.9e20`, which would have dominated the mean by 15
+   orders of magnitude.)
+
+`SkipReason` is deterministic: structural errors take precedence, followed
+by the first semantic field error (left to right); `spd` is validated after
+the payload scan. The three logical stages are implemented as a single
+`memchr`-based pass — the number of validation stages and the number of
+passes over the line are independent.
+
+There is deliberately **no** rule keyed on marker names such as
+`CorruptPayload`: corruption is detected from the data, not from a label.
+
+Each skipped line is counted under its `SkipReason`, logged
+(`skipped malformed line N [InvalidNodeUid]: <first 120 chars>`), and parsing
+continues to the end of the stream. Chunk boundaries are handled by the
+carry buffer, verified by a test that feeds the whole file in 7-byte chunks
+and requires results identical to a single-chunk run.
 
 **Measured on the provided 500 MB file** (3,483,528 lines):
 
-| corruption type                   | lines |
-|-----------------------------------|------:|
-| garbage insertion (no structure)  | 5     |
-| missing opening bracket           | 2     |
-| missing closing bracket           | 6     |
-| out-of-range `spd` (~8.9e20)      | 6     |
-| **total skipped**                 | **19**|
+| SkipReason           | lines | what it caught                                   |
+|----------------------|------:|--------------------------------------------------|
+| `InvalidTimestamp`   | 2     | missing opening bracket (`HeadBraceLoss`)        |
+| `InvalidHeaderField` | 11    | 5 garbage insertions + 6 unclosed `[n` (`OpenBraceLeak`) |
+| `InvalidNodeUid`     | 7     | `nodeUID[NONE]` (`CorruptPayload`)               |
+| `InvalidSpeed`       | 6     | `spd[8.9e20]` (`BeyondLimit`)                    |
+| **total skipped**    | **26**|                                                  |
 
-Result: `parsed_lines = 3,483,509`, `average_speed = 137500.000000`
-(with poison included the average would have been ~9.2e15).
+Result: `parsed_lines = 3,483,502`, `average_speed = 137500.000000`
+(with poison included the average would have been ~9.2e15). The per-field
+validation costs ~0.2 s per 500 MB over a parser that only searched for
+`spd[` (0.83 s vs 0.63 s end-to-end on loopback, ≈600 MB/s) — still far above
+any network link, and the bracket scan is `memchr`-based rather than
+per-character for exactly that reason.
 
 ## result.csv Format
 
@@ -216,12 +288,18 @@ section,date_hour,module,count
 module_count,2026-06-19 22,RadarTrackNodeState,21458
 ...
 summary,average_speed,,137500.000000
-summary,parsed_lines,,3483509
-summary,skipped_lines,,19
+summary,parsed_lines,,3483502
+summary,skipped_lines,,26
+summary,skipped_InvalidTimestamp,,2
+summary,skipped_InvalidHeaderField,,11
+summary,skipped_InvalidNodeUid,,7
+summary,skipped_InvalidSpeed,,6
 ```
 
 Task 1 rows (`module_count`) group occurrences by (date+hour, module);
-summary rows carry the Task 2 average and the parse accounting. Fields are
+summary rows carry the Task 2 average and the parse accounting, including
+one `skipped_<SkipReason>` row per reason that occurred (the per-reason rows
+sum to `skipped_lines`). Fields are
 written per RFC 4180 (quoted, with embedded quotes doubled, whenever a value
 would otherwise contain a delimiter), and
 `parsed_lines + skipped_lines == total lines received` always holds.

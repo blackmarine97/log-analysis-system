@@ -16,8 +16,13 @@
 // only after libuv confirms the handle is closed (onClosed callback). All
 // libuv callback trampolines recover `this` from handle->data; no manual
 // new/delete anywhere.
+//
+// Threading: everything here runs on the loop thread. The two things that
+// could block it — log file I/O and the result.csv copy — are delegated to
+// Logger's writer thread and CsvWriter (libuv thread pool) respectively.
 
 #include "../common/Protocol.h"
+#include "CsvWriter.h"
 #include "Logger.h"
 #include "StreamParser.h"
 
@@ -25,8 +30,6 @@
 
 #include <array>
 #include <cstdint>
-#include <cstdio>
-#include <fstream>
 #include <functional>
 #include <sstream>
 #include <string>
@@ -38,16 +41,18 @@ public:
     using ClosedCallback = std::function<void(Session*)>;
 
     Session(uv_loop_t* loop, uint64_t id, Logger& log,
-            std::string csvPath, ClosedCallback onClosed)
+            CsvWriter& csv, ClosedCallback onClosed)
         : id_(id),
           log_(log),
-          csvPath_(std::move(csvPath)),
+          csv_(csv),
           onClosed_(std::move(onClosed)),
           readBuf_(kReadBufSize),
-          parser_([this](uint64_t lineNo, std::string_view line) {
+          parser_([this](uint64_t lineNo, SkipReason why,
+                         std::string_view line) {
               std::ostringstream os;
               os << "session " << id_ << ": skipped malformed line "
-                 << lineNo << ": " << line.substr(0, 120);
+                 << lineNo << " [" << toString(why) << "]: "
+                 << line.substr(0, 120);
               log_.warn(os.str());
           }) {
         uv_tcp_init(loop, &tcp_);
@@ -196,13 +201,12 @@ private:
 
         std::ostringstream csv;
         parser_.writeCsv(csv);
-        const std::string body = csv.str();
+        std::string body = csv.str();
 
-        // Keep a server-side copy as evidence/debug artifact. Written to a
-        // per-session temporary first and then renamed: concurrent sessions
-        // share one csvPath_, and rename(2) is atomic, so a reader never sees
-        // two sessions' output interleaved in the same file.
-        if (!csvPath_.empty()) writeCsvFile(body);
+        // Server-side copy as evidence/debug artifact: handed to CsvWriter,
+        // which does the blocking file I/O on the libuv thread pool. The
+        // session does not wait for it — the response goes out immediately.
+        csv_.submit(id_, body);
 
         const Stats& st = parser_.stats();
         log_.info("session " + std::to_string(id_) + ": parse complete, lines=" +
@@ -210,32 +214,7 @@ private:
                   std::to_string(st.skippedLines) + " speedCount=" +
                   std::to_string(st.speedCount));
 
-        sendFrame(proto::MsgType::ResultCsv, body);
-    }
-
-    void writeCsvFile(const std::string& body) {
-        const std::string tmp = csvPath_ + ".tmp." + std::to_string(id_);
-        {
-            std::ofstream out(tmp, std::ios::trunc);
-            if (!out) {
-                log_.warn("session " + std::to_string(id_) +
-                          ": cannot write " + tmp);
-                return;
-            }
-            out << body;
-            out.flush();
-            if (!out) {
-                log_.warn("session " + std::to_string(id_) +
-                          ": failed writing " + tmp);
-                std::remove(tmp.c_str());
-                return;
-            }
-        }
-        if (std::rename(tmp.c_str(), csvPath_.c_str()) != 0) {
-            log_.warn("session " + std::to_string(id_) +
-                      ": cannot rename " + tmp + " -> " + csvPath_);
-            std::remove(tmp.c_str());
-        }
+        sendFrame(proto::MsgType::ResultCsv, std::move(body));
     }
 
     void sendError(std::string_view message) {
@@ -268,7 +247,7 @@ private:
     uv_write_t     writeReq_{};
     uint64_t       id_;
     Logger&        log_;
-    std::string    csvPath_;
+    CsvWriter&     csv_;
     ClosedCallback onClosed_;
 
     State    state_ = State::ReadHeader;

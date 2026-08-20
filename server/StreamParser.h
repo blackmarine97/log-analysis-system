@@ -4,6 +4,7 @@
 
 #include "LineParser.h"
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -22,6 +23,8 @@ struct Stats {
 
     uint64_t totalLines   = 0;
     uint64_t skippedLines = 0;
+    // skippedLines broken down by SkipReason (index = enum value).
+    std::array<uint64_t, kSkipReasonCount> skippedByReason{};
 
     // Upper bound on distinct (dateHour, module) keys. Corrupt data can invent
     // an unbounded number of module names; without a cap the map — and thus the
@@ -53,8 +56,9 @@ struct Stats {
 
 class StreamParser {
 public:
-    // Called for each malformed line: (lineNumber, rawLine) — hook for spdlog.
-    using MalformedHook = std::function<void(uint64_t, std::string_view)>;
+    // Called for each malformed line: (lineNumber, reason, rawLine).
+    using MalformedHook =
+        std::function<void(uint64_t, SkipReason, std::string_view)>;
 
     explicit StreamParser(MalformedHook onMalformed = {})
         : onMalformed_(std::move(onMalformed)) {}
@@ -75,7 +79,7 @@ public:
             carry_.find('\n') == std::string::npos) {
             if (!resyncing_) {
                 ++stats_.totalLines;
-                reportMalformed(carry_);
+                reportMalformed(SkipReason::OversizedLine, carry_);
             }
             carry_.clear();
             resyncing_ = true;
@@ -112,6 +116,7 @@ public:
     //   summary,average_speed,,137500.000000
     //   summary,parsed_lines,,29
     //   summary,skipped_lines,,1
+    //   summary,skipped_InvalidSpeed,,1        (one row per non-zero reason)
     void writeCsv(std::ostream& os) const {
         os << "section,date_hour,module,count\n";
         for (const auto& [key, count] : stats_.moduleCounts) {
@@ -134,6 +139,11 @@ public:
         os << '\n';
         os << "summary,parsed_lines,," << stats_.parsedLines() << '\n';
         os << "summary,skipped_lines,," << stats_.skippedLines << '\n';
+        for (size_t i = 1; i < kSkipReasonCount; ++i) {
+            if (stats_.skippedByReason[i] == 0) continue;
+            os << "summary,skipped_" << toString(static_cast<SkipReason>(i))
+               << ",," << stats_.skippedByReason[i] << '\n';
+        }
     }
 
 private:
@@ -155,17 +165,15 @@ private:
 
     void processLine(std::string_view line) {
         ++stats_.totalLines;
-        if (line.empty()) { reportMalformed(line); return; }
-        if (auto parsed = LineParser::parse(line)) {
-            stats_.accumulate(*parsed);
-        } else {
-            reportMalformed(line);
-        }
+        const ParseResult r = LineParser::parse(line);
+        if (r.valid) stats_.accumulate(r.line);
+        else         reportMalformed(r.reason, line);
     }
 
-    void reportMalformed(std::string_view line) {
+    void reportMalformed(SkipReason why, std::string_view line) {
         ++stats_.skippedLines;
-        if (onMalformed_) onMalformed_(stats_.totalLines, line);
+        ++stats_.skippedByReason[static_cast<size_t>(why)];
+        if (onMalformed_) onMalformed_(stats_.totalLines, why, line);
     }
 
     static constexpr size_t kMaxLineBytes = 1 << 20;   // 1 MiB safety cap

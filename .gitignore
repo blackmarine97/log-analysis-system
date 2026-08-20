@@ -1,5 +1,5 @@
 # build trees
-build/
+build*/
 build-client/
 out/
 
