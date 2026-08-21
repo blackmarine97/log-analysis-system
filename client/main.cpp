@@ -464,7 +464,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         if (logLines.size() > 1000)
             logLines.erase(logLines.begin(), logLines.end() - 1000);
         ImGui::Checkbox("Auto-scroll", &autoScroll);
-        ImGui::BeginChild("logpane", ImVec2(0, 0), ImGuiChildFlags_Borders);
+        ImGui::BeginChild("logpane", ImVec2(0, 0), ImGuiChildFlags_Borders,
+                          ImGuiWindowFlags_HorizontalScrollbar);
         for (const auto& line : logLines)
             ImGui::TextUnformatted(line.c_str());
         if (autoScroll && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1)
