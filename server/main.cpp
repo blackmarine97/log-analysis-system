@@ -16,6 +16,7 @@
 
 #include <uv.h>
 
+#include <charconv>
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
@@ -40,6 +41,18 @@ void printUsage() {
         "                  [--log FILE] [--csv FILE] [--idle-timeout SEC]\n";
 }
 
+// Strict decimal parse: "abc" or "60x" is an error, not silently 0 as with
+// atoi (which would e.g. disable the idle timeout on a typo).
+bool parseInt(const std::string& s, int& out) {
+    if (s.empty()) return false;
+    int value = 0;
+    const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(),
+                                           value);
+    if (ec != std::errc{} || ptr != s.data() + s.size()) return false;
+    out = value;
+    return true;
+}
+
 bool parseArgs(int argc, char** argv, Options& opt) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -49,13 +62,14 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             return true;
         };
         std::string v;
-        if (arg == "--port" && next(v))      opt.port = std::atoi(v.c_str());
-        else if (arg == "--bind" && next(v)) opt.bindAddr = v;
-        else if (arg == "--log" && next(v))  opt.logPath = v;
-        else if (arg == "--csv" && next(v))  opt.csvPath = v;
-        else if (arg == "--idle-timeout" && next(v))
-            opt.idleTimeoutSec = std::atoi(v.c_str());
-        else if (arg == "--daemon")          opt.daemonize = true;
+        if (arg == "--port" && next(v)) {
+            if (!parseInt(v, opt.port)) { printUsage(); return false; }
+        } else if (arg == "--bind" && next(v)) opt.bindAddr = v;
+        else if (arg == "--log" && next(v))    opt.logPath = v;
+        else if (arg == "--csv" && next(v))    opt.csvPath = v;
+        else if (arg == "--idle-timeout" && next(v)) {
+            if (!parseInt(v, opt.idleTimeoutSec)) { printUsage(); return false; }
+        } else if (arg == "--daemon")          opt.daemonize = true;
         else { printUsage(); return false; }
     }
     if (opt.port <= 0 || opt.port > 65535) { printUsage(); return false; }

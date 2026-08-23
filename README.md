@@ -48,6 +48,21 @@ cmake --build build -j
 `--idle-timeout SEC` closes a connection that makes no progress for that
 long (default 60 s, `0` disables) — see *Robustness on disconnect*.
 
+**Prebuilt binary.** `bin/log_server` is a fully static x86-64 build
+(`-static`, libuv compiled in via FetchContent) so it runs on any Linux
+without installing libuv, and independently of the host's glibc/libstdc++
+versions. To reproduce it:
+
+```bash
+cmake -B build-static -DCMAKE_BUILD_TYPE=Release -DLOG_SERVER_STATIC=ON
+cmake --build build-static --target log_server -j
+strip build-static/server/log_server
+```
+
+(The linker prints two warnings about `getpwuid_r`/`getgrgid_r` in static
+binaries; they come from libuv's `uv_os_get_passwd` helpers, which this
+server never calls.)
+
 `--daemon` detaches the process into the background (output goes to the
 `--log` file). Stop it gracefully with `SIGTERM`.
 

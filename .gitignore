@@ -19,3 +19,4 @@ imgui.ini
 # IDE
 .vs/
 .vscode/
+build-static/

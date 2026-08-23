@@ -3,9 +3,17 @@
 # libuv resolution order:
 #   1. system package (libuv1-dev)  -- fast path
 #   2. FetchContent from GitHub     -- zero-setup fallback for graders
+#
+# LOG_SERVER_STATIC=ON builds the distributable binary in bin/: libuv is
+# always fetched and linked statically and the executable is fully static
+# (-static), so it runs on any x86-64 Linux regardless of the installed
+# libuv / glibc / libstdc++ versions. Default OFF keeps the fast dev build.
+option(LOG_SERVER_STATIC "Fully static log_server for distribution" OFF)
 
-find_path(LIBUV_INCLUDE_DIR uv.h)
-find_library(LIBUV_LIBRARY NAMES uv libuv)
+if(NOT LOG_SERVER_STATIC)
+    find_path(LIBUV_INCLUDE_DIR uv.h)
+    find_library(LIBUV_LIBRARY NAMES uv libuv)
+endif()
 
 if(LIBUV_INCLUDE_DIR AND LIBUV_LIBRARY)
     message(STATUS "Using system libuv: ${LIBUV_LIBRARY}")
@@ -35,6 +43,9 @@ target_include_directories(log_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..)      # for common/Protocol.h
 target_link_libraries(log_server PRIVATE libuv_dep Threads::Threads)
+if(LOG_SERVER_STATIC)
+    target_link_options(log_server PRIVATE -static)
+endif()
 
 add_executable(parser_test tests/parser_test.cpp)
 target_compile_options(parser_test PRIVATE ${COMMON_WARNINGS})
