@@ -15,8 +15,9 @@
 
 class TcpServer {
 public:
-    TcpServer(uv_loop_t* loop, Logger& log, CsvWriter& csv)
-        : loop_(loop), log_(log), csv_(csv) {
+    TcpServer(uv_loop_t* loop, Logger& log, CsvWriter& csv,
+              uint64_t idleTimeoutMs)
+        : loop_(loop), log_(log), csv_(csv), idleTimeoutMs_(idleTimeoutMs) {
         uv_tcp_init(loop_, &listener_);
         listener_.data = this;
     }
@@ -71,7 +72,7 @@ private:
         }
         const uint64_t id = self->nextId_++;
         auto session = std::make_unique<Session>(
-            self->loop_, id, self->log_, self->csv_,
+            self->loop_, id, self->log_, self->csv_, self->idleTimeoutMs_,
             [self](Session* s) { self->sessions_.erase(s); });
 
         Session* raw = session.get();
@@ -89,6 +90,7 @@ private:
     uv_tcp_t    listener_{};
     Logger&     log_;
     CsvWriter&  csv_;
+    uint64_t    idleTimeoutMs_;
     bool        shuttingDown_ = false;
     uint64_t    nextId_ = 1;
     std::unordered_map<Session*, std::unique_ptr<Session>> sessions_;

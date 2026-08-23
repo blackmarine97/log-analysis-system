@@ -42,7 +42,11 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ./build/server/log_server [--port 5555] [--bind 0.0.0.0] [--daemon]
                           [--log server.log] [--csv result.csv]
+                          [--idle-timeout 60]
 ```
+
+`--idle-timeout SEC` closes a connection that makes no progress for that
+long (default 60 s, `0` disables) — see *Robustness on disconnect*.
 
 `--daemon` detaches the process into the background (output goes to the
 `--log` file). Stop it gracefully with `SIGTERM`.
@@ -164,6 +168,15 @@ exit, 0 errors) on an upload + mid-transfer abort + SIGTERM scenario.
   session is closed and reclaimed; the server keeps serving. Verified by
   hard-closing the socket after 200 MB — the very next upload succeeded and
   produced a byte-identical CSV.
+- Server, silent peer: a client that vanishes without FIN/RST (power loss,
+  pulled cable, NAT eviction) or connects and never sends produces no
+  socket error at all, so each session also carries a libuv idle timer
+  (`--idle-timeout`, default 60 s) that is re-armed on every received
+  chunk. When it fires the session is closed through the same path as a
+  read error, so a long-running daemon cannot accumulate zombie sessions
+  and leak file descriptors. Verified under valgrind: two stalled
+  connections (no bytes / 5-byte partial header) were reclaimed after the
+  timeout while a concurrent upload completed normally — no leaks.
 - Client: all blocking calls carry a 30 s `SO_SNDTIMEO`/`SO_RCVTIMEO`;
   a lost connection surfaces as a failed `send`/`recv`, the worker logs it,
   the RAII socket wrapper releases the handle, and the UI shows *failed*.

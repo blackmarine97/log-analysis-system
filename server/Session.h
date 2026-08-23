@@ -40,11 +40,14 @@ class Session {
 public:
     using ClosedCallback = std::function<void(Session*)>;
 
+    // idleTimeoutMs: close the connection if no byte arrives (or, while
+    // responding, the write does not complete) for this long. 0 disables.
     Session(uv_loop_t* loop, uint64_t id, Logger& log,
-            CsvWriter& csv, ClosedCallback onClosed)
+            CsvWriter& csv, uint64_t idleTimeoutMs, ClosedCallback onClosed)
         : id_(id),
           log_(log),
           csv_(csv),
+          idleTimeoutMs_(idleTimeoutMs),
           onClosed_(std::move(onClosed)),
           readBuf_(kReadBufSize),
           parser_([this](uint64_t lineNo, SkipReason why,
@@ -57,6 +60,8 @@ public:
           }) {
         uv_tcp_init(loop, &tcp_);
         tcp_.data = this;
+        uv_timer_init(loop, &idle_);
+        idle_.data = this;
     }
 
     // Non-copyable, non-movable: libuv holds a stable pointer to tcp_.
@@ -67,14 +72,21 @@ public:
     // must still close() the session to release the handle.
     bool accept(uv_stream_t* listener) {
         if (uv_accept(listener, streamHandle()) != 0) return false;
+        touchIdle();
         return uv_read_start(streamHandle(), &Session::onAlloc,
                              &Session::onRead) == 0;
     }
 
+    // Closes both handles. The session is handed back to its owner only
+    // after libuv has confirmed *both* are closed (see onHandleClosed).
     void close() {
         if (closing_) return;
         closing_ = true;
-        uv_close(reinterpret_cast<uv_handle_t*>(&tcp_), &Session::onClosed);
+        pendingCloses_ = 2;
+        uv_close(reinterpret_cast<uv_handle_t*>(&idle_),
+                 &Session::onHandleClosed);
+        uv_close(reinterpret_cast<uv_handle_t*>(&tcp_),
+                 &Session::onHandleClosed);
     }
 
     uint64_t id() const { return id_; }
@@ -99,6 +111,7 @@ private:
     static void onRead(uv_stream_t* s, ssize_t nread, const uv_buf_t* buf) {
         auto* self = static_cast<Session*>(s->data);
         if (nread > 0) {
+            self->touchIdle();            // progress: push the deadline out
             self->consume(std::string_view(buf->base,
                                            static_cast<size_t>(nread)));
         } else if (nread < 0) {
@@ -134,10 +147,35 @@ private:
         self->close();
     }
 
-    static void onClosed(uv_handle_t* h) {
+    // Fired once per handle (tcp_, idle_). Only the last one hands the
+    // session back to its owner — until then libuv may still touch the
+    // other handle, so the object must stay alive.
+    static void onHandleClosed(uv_handle_t* h) {
         auto* self = static_cast<Session*>(h->data);
-        // Last line of the session's life: hand ourselves back to the owner.
+        if (--self->pendingCloses_ > 0) return;
         if (self->onClosed_) self->onClosed_(self);
+    }
+
+    // Idle deadline expired: nothing arrived (or the response did not
+    // finish writing) for idleTimeoutMs_. A silently vanished peer — power
+    // loss, pulled cable, NAT eviction — produces no FIN/RST, so without
+    // this the session (fd + ~70 KB) would linger until the daemon exits.
+    static void onIdle(uv_timer_t* t) {
+        auto* self = static_cast<Session*>(t->data);
+        std::ostringstream os;
+        os << "session " << self->id_ << ": idle timeout ("
+           << self->idleTimeoutMs_ << " ms without progress) after "
+           << self->payloadReceived_ << '/' << self->payloadExpected_
+           << " payload bytes, closing";
+        self->log_.warn(os.str());
+        self->close();
+    }
+
+    // (Re)arm the idle deadline. uv_timer_start on a running timer simply
+    // restarts it, so calling this on every received chunk is cheap.
+    void touchIdle() {
+        if (idleTimeoutMs_ == 0 || closing_) return;
+        uv_timer_start(&idle_, &Session::onIdle, idleTimeoutMs_, 0);
     }
 
     // ---- protocol state machine ----------------------------------------
@@ -197,6 +235,7 @@ private:
     void finalize() {
         state_ = State::Responding;
         uv_read_stop(streamHandle());
+        touchIdle();   // the response write gets a full idle window too
         parser_.finish();
 
         std::ostringstream csv;
@@ -244,14 +283,17 @@ private:
 
     // ---- members --------------------------------------------------------
     uv_tcp_t       tcp_{};
+    uv_timer_t     idle_{};
     uv_write_t     writeReq_{};
     uint64_t       id_;
     Logger&        log_;
     CsvWriter&     csv_;
+    uint64_t       idleTimeoutMs_;
     ClosedCallback onClosed_;
 
     State    state_ = State::ReadHeader;
     bool     closing_ = false;
+    int      pendingCloses_ = 0;
 
     std::array<char, proto::kHeaderSize> header_{};
     size_t   headerFill_ = 0;

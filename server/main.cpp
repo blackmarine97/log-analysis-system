@@ -3,10 +3,12 @@
 //
 // Usage:
 //   ./log_server [--port N] [--bind ADDR] [--daemon]
-//                [--log FILE] [--csv FILE]
+//                [--log FILE] [--csv FILE] [--idle-timeout SEC]
 //
 // Defaults: port 5555, bind 0.0.0.0, foreground, log to stderr,
-//           server-side CSV copy to ./result.csv.
+//           server-side CSV copy to ./result.csv, idle timeout 60 s
+//           (0 disables; a connection that makes no progress for this
+//           long is closed and its resources reclaimed).
 
 #include "CsvWriter.h"
 #include "Logger.h"
@@ -29,12 +31,13 @@ struct Options {
     bool        daemonize = false;
     std::string logPath;              // empty -> stderr
     std::string csvPath = "result.csv";
+    int         idleTimeoutSec = 60;  // 0 = disabled
 };
 
 void printUsage() {
     std::cerr <<
         "usage: log_server [--port N] [--bind ADDR] [--daemon]\n"
-        "                  [--log FILE] [--csv FILE]\n";
+        "                  [--log FILE] [--csv FILE] [--idle-timeout SEC]\n";
 }
 
 bool parseArgs(int argc, char** argv, Options& opt) {
@@ -50,10 +53,13 @@ bool parseArgs(int argc, char** argv, Options& opt) {
         else if (arg == "--bind" && next(v)) opt.bindAddr = v;
         else if (arg == "--log" && next(v))  opt.logPath = v;
         else if (arg == "--csv" && next(v))  opt.csvPath = v;
+        else if (arg == "--idle-timeout" && next(v))
+            opt.idleTimeoutSec = std::atoi(v.c_str());
         else if (arg == "--daemon")          opt.daemonize = true;
         else { printUsage(); return false; }
     }
     if (opt.port <= 0 || opt.port > 65535) { printUsage(); return false; }
+    if (opt.idleTimeoutSec < 0) { printUsage(); return false; }
     return true;
 }
 
@@ -84,7 +90,8 @@ int main(int argc, char** argv) {
     log.info("log_server starting (pid " + std::to_string(getpid()) + ')');
 
     CsvWriter csvWriter(&loop, log, opt.csvPath);
-    TcpServer server(&loop, log, csvWriter);
+    TcpServer server(&loop, log, csvWriter,
+                     static_cast<uint64_t>(opt.idleTimeoutSec) * 1000);
     if (!server.listen(opt.bindAddr, opt.port)) {
         uv_loop_close(&loop);
         return 1;
