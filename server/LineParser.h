@@ -1,10 +1,6 @@
 #pragma once
 // LineParser: stateless, non-throwing parser for BYDA radar log lines.
 //
-// Expected format:
-// [2026-06-19_22:00:00.045000][7710][30482][1885246073] BYDA::RadarTrackNodeState: node_state_synced: nodeUID[47], rfLane[3], lockState[1->0]
-// |<---- timestamp (28ch) --->|<-- 3 numeric fields -->| |<-- module -->| |<------------- payload: free text + key[value] fields ----->|
-//
 // Validation pipeline (each stage can reject; the first failure is reported):
 //
 //   1. Structural   timestamp, three [n] header fields, BYDA::<Module>:,
@@ -14,12 +10,6 @@
 //                   Unknown keys are never inspected: pattern[SW3] and
 //                   command[RUN] are legitimate non-numeric values.
 //   3. Speed        spd[...] -> finite, 0 <= v < 1e9 (Task 2 input)
-//
-// Every rejection carries a SkipReason so the caller can log it and keep
-// per-reason counts. SkipReason is deterministic: structural errors take
-// precedence, then the first semantic field error (left to right), and spd
-// is validated after the payload scan. Nothing here throws; poison data can
-// only yield a ParseResult with valid == false.
 
 #include <array>
 #include <charconv>

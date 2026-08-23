@@ -19,4 +19,6 @@ imgui.ini
 # IDE
 .vs/
 .vscode/
+.idea/
+cmake-build-*/
 build-static/

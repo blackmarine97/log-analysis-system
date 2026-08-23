@@ -7,7 +7,7 @@
 // in UniqueSocket, the worker in std::thread joined by ~NetClient — the
 // assignment's "no manual memory management" rule holds in every layer.
 
-#include "NetClient.h"   // must precede windows.h (winsock2 include order)
+#include "NetClient.h"
 
 #include <d3d11.h>
 #include <windows.h>
@@ -39,7 +39,6 @@ static ComPtr<ID3D11DeviceContext>    g_context;
 static ComPtr<IDXGISwapChain>         g_swapChain;
 static ComPtr<ID3D11RenderTargetView> g_rtv;
 
-// Set by WM_DROPFILES (message pump thread == UI thread; no locking needed),
 // consumed once per frame by the main loop.
 static std::wstring g_droppedFile;
 
@@ -216,7 +215,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGui::GetIO().IniFilename = nullptr;   // no imgui.ini clutter
+    ImGui::GetIO().IniFilename = nullptr;
     ImGui::StyleColorsDark();
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_device.Get(), g_context.Get());
@@ -231,7 +230,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     std::vector<char> hostBuf(64, '\0');
     std::string("127.0.0.1").copy(hostBuf.data(), hostBuf.size() - 1);
     int port = 5555;
-    bool autoScroll = true;
     bool autoSave = true;
 
     // transfer-rate / timing state (UI-side, derived from polled atomics)
@@ -370,7 +368,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
         ImGui::Spacing();
 
-        // -- action row
         ImGui::BeginDisabled(busy || logPath.empty());
         if (ImGui::Button("Upload", ImVec2(120, 0)))
             net.start(hostBuf.data(), port, logPath);
@@ -457,19 +454,22 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             }
         }
 
-        // -- log pane
+        // -- log pane (newest entry on top)
         ImGui::Spacing();
         ImGui::SeparatorText("Activity log");
+
         for (auto& line : net.drainLog()) logLines.push_back(std::move(line));
         if (logLines.size() > 1000)
             logLines.erase(logLines.begin(), logLines.end() - 1000);
-        ImGui::Checkbox("Auto-scroll", &autoScroll);
+        ImGui::BeginDisabled(logLines.empty());
+        if (ImGui::Button("Clear log")) logLines.clear();
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::TextDisabled("%zu entries, newest first", logLines.size());
         ImGui::BeginChild("logpane", ImVec2(0, 0), ImGuiChildFlags_Borders,
                           ImGuiWindowFlags_HorizontalScrollbar);
-        for (const auto& line : logLines)
-            ImGui::TextUnformatted(line.c_str());
-        if (autoScroll && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1)
-            ImGui::SetScrollHereY(1.0f);
+        for (auto it = logLines.rbegin(); it != logLines.rend(); ++it)
+            ImGui::TextUnformatted(it->c_str());
         ImGui::EndChild();
 
         ImGui::End();

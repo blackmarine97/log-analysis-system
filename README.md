@@ -26,7 +26,9 @@ receiving it**, aggregates statistics, and returns `result.csv` to the client.
 ├── client/            # Windows GUI client (Dear ImGui + DX11)
 │   ├── NetClient.h    #   worker-thread uploader (WinSock, RAII)
 │   └── main.cpp
-└── bin/               # prebuilt binaries (log_server, log_client.exe)
+├── bin/               # prebuilt binaries (log_server, log_client.exe)
+├── run_server.sh      # start the prebuilt server (Linux / WSL)
+└── run_server.bat     # same, double-click from Windows (runs inside WSL)
 ```
 
 ## Build Instructions
@@ -47,6 +49,12 @@ cmake --build build -j
 
 `--idle-timeout SEC` closes a connection that makes no progress for that
 long (default 60 s, `0` disables) — see *Robustness on disconnect*.
+
+**Launchers.** To start the prebuilt server with defaults (port 5555, CSV
+copy to `./result.csv`, log to the console) without typing the path:
+`./run_server.sh` on Linux/WSL, or double-click `run_server.bat` on Windows,
+which starts the server inside WSL from the repository's location. Both pass
+extra options through, e.g. `run_server.bat --port 6000`.
 
 **Prebuilt binary.** `bin/log_server` is a fully static x86-64 build
 (`-static`, libuv compiled in via FetchContent) so it runs on any Linux
@@ -107,6 +115,13 @@ next to the selected log (toggleable) and **Save result.csv...** stores a
 copy anywhere else. **Cancel** aborts an in-flight transfer safely, and
 socket failures surface as human-readable messages
 (`connect failed: server not reachable - is it running? (WSA 10061)`).
+The **Activity log** pane lists events newest-first and can be emptied with
+**Clear log**.
+
+> Build the client on a local drive. From a `\\wsl.localhost\...` path
+> Windows git refuses to clone Dear ImGui ("dubious ownership") and MSBuild
+> cannot track dependencies on a network share; copy `client/` and `common/`
+> side by side to e.g. `C:\logclient\` and run the two commands there.
 
 ## Network Architecture
 
