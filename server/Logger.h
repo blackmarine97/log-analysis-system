@@ -30,6 +30,31 @@
 #include <thread>
 #include <utility>
 
+// Renders untrusted bytes (e.g. a corrupt log line) safe for a log file and
+// for terminals that will display it: printable ASCII passes through, every
+// other byte (control chars, '\r', ANSI ESC, raw UTF-8) becomes \xNN, and
+// input is capped at maxLen bytes with a "..." marker. Without this, poison
+// data containing '\n' or ESC sequences could forge log entries or corrupt
+// the terminal of whoever reads the log (log injection).
+inline std::string sanitizeForLog(std::string_view raw, size_t maxLen = 120) {
+    std::string out;
+    const size_t n = raw.size() < maxLen ? raw.size() : maxLen;
+    out.reserve(n + 16);
+    static const char* hex = "0123456789abcdef";
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char c = static_cast<unsigned char>(raw[i]);
+        if (c >= 0x20 && c <= 0x7E) {
+            out += static_cast<char>(c);
+        } else {
+            out += "\\x";
+            out += hex[c >> 4];
+            out += hex[c & 0xF];
+        }
+    }
+    if (raw.size() > maxLen) out += "...";
+    return out;
+}
+
 class Logger {
 public:
     // If `path` is empty or cannot be opened, log lines go to stderr instead

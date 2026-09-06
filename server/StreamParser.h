@@ -68,6 +68,12 @@ public:
     void feed(std::string_view chunk) {
         carry_.append(chunk);
 
+        // Every search below starts at scanned_: carry_[0, scanned_) was
+        // already searched by previous feed()s and contains no '\n'. Without
+        // this, a pathological input with no newline would make each feed()
+        // rescan the whole carry buffer from the start — O(n^2) over the
+        // window (bounded by kMaxLineBytes, but needlessly so).
+        //
         // Defense against a poison "line" with no newline for megabytes:
         // if the carry buffer exceeds the cap without a newline, drop it as
         // one malformed line and resynchronize at the next '\n'.
@@ -76,18 +82,21 @@ public:
         // the tail. Counting totalLines here too keeps the
         // totalLines = parsed + skipped invariant that writeCsv() relies on.
         if (carry_.size() > kMaxLineBytes &&
-            carry_.find('\n') == std::string::npos) {
+            carry_.find('\n', scanned_) == std::string::npos) {
             if (!resyncing_) {
                 ++stats_.totalLines;
                 reportMalformed(SkipReason::OversizedLine, carry_);
             }
             carry_.clear();
+            scanned_ = 0;
             resyncing_ = true;
             return;
         }
 
-        size_t start = 0, pos;
-        while ((pos = carry_.find('\n', start)) != std::string::npos) {
+        size_t start = 0;
+        size_t searchFrom = scanned_;   // line starts at `start`, but bytes
+        size_t pos;                     // before scanned_ hold no '\n'
+        while ((pos = carry_.find('\n', searchFrom)) != std::string::npos) {
             std::string_view line(carry_.data() + start, pos - start);
             if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
             if (resyncing_) {
@@ -96,14 +105,17 @@ public:
                 processLine(line);
             }
             start = pos + 1;
+            searchFrom = start;
         }
         carry_.erase(0, start);
+        scanned_ = carry_.size();       // the remainder holds no '\n'
     }
 
     // Call once after the last chunk (handles a final line without '\n').
     void finish() {
         if (!carry_.empty() && !resyncing_) processLine(carry_);
         carry_.clear();
+        scanned_ = 0;
         resyncing_ = false;
     }
 
@@ -179,6 +191,7 @@ private:
     static constexpr size_t kMaxLineBytes = 1 << 20;   // 1 MiB safety cap
 
     std::string   carry_;          // partial line across chunk boundaries
+    size_t        scanned_ = 0;    // carry_[0, scanned_) contains no '\n'
     bool          resyncing_ = false;
     Stats         stats_;
     MalformedHook onMalformed_;

@@ -4,6 +4,7 @@
 // Usage:
 //   ./log_server [--port N] [--bind ADDR] [--daemon]
 //                [--log FILE] [--csv FILE] [--idle-timeout SEC]
+//                [--max-conns N] [--cache-dir DIR] [--spool-dir DIR]
 //
 // Defaults: port 5555, bind 0.0.0.0, foreground, log to stderr,
 //           server-side CSV copy to ./result.csv, idle timeout 60 s
@@ -11,6 +12,8 @@
 //           long is closed and its resources reclaimed).
 
 #include "CsvWriter.h"
+#include "ResultCache.h"
+#include "SpoolStore.h"
 #include "Logger.h"
 #include "TcpServer.h"
 
@@ -33,12 +36,16 @@ struct Options {
     std::string logPath;              // empty -> stderr
     std::string csvPath = "result.csv";
     int         idleTimeoutSec = 60;  // 0 = disabled
+    int         maxConns = 32;        // concurrent-session cap
+    std::string cacheDir = "results"; // FetchResult cache; "" = memory-only
+    std::string spoolDir = "spool";   // resumable uploads; "" disables resume
 };
 
 void printUsage() {
     std::cerr <<
         "usage: log_server [--port N] [--bind ADDR] [--daemon]\n"
-        "                  [--log FILE] [--csv FILE] [--idle-timeout SEC]\n";
+        "                  [--log FILE] [--csv FILE] [--idle-timeout SEC]\n"
+        "                  [--max-conns N] [--cache-dir DIR] [--spool-dir DIR]\n";
 }
 
 // Strict decimal parse: "abc" or "60x" is an error, not silently 0 as with
@@ -69,11 +76,16 @@ bool parseArgs(int argc, char** argv, Options& opt) {
         else if (arg == "--csv" && next(v))    opt.csvPath = v;
         else if (arg == "--idle-timeout" && next(v)) {
             if (!parseInt(v, opt.idleTimeoutSec)) { printUsage(); return false; }
-        } else if (arg == "--daemon")          opt.daemonize = true;
+        } else if (arg == "--max-conns" && next(v)) {
+            if (!parseInt(v, opt.maxConns)) { printUsage(); return false; }
+        } else if (arg == "--cache-dir" && next(v)) opt.cacheDir = v;
+        else if (arg == "--spool-dir" && next(v))   opt.spoolDir = v;
+        else if (arg == "--daemon")            opt.daemonize = true;
         else { printUsage(); return false; }
     }
     if (opt.port <= 0 || opt.port > 65535) { printUsage(); return false; }
     if (opt.idleTimeoutSec < 0) { printUsage(); return false; }
+    if (opt.maxConns < 1) { printUsage(); return false; }
     return true;
 }
 
@@ -104,8 +116,13 @@ int main(int argc, char** argv) {
     log.info("log_server starting (pid " + std::to_string(getpid()) + ')');
 
     CsvWriter csvWriter(&loop, log, opt.csvPath);
-    TcpServer server(&loop, log, csvWriter,
-                     static_cast<uint64_t>(opt.idleTimeoutSec) * 1000);
+    // Recent analyses for FetchResult retries; the disk tier under
+    // opt.cacheDir lets results survive a server restart.
+    ResultCache resultCache(&loop, log, opt.cacheDir);
+    SpoolStore spool(log, opt.spoolDir);   // resumable-upload byte store
+    TcpServer server(&loop, log, csvWriter, resultCache, spool,
+                     static_cast<uint64_t>(opt.idleTimeoutSec) * 1000,
+                     static_cast<size_t>(opt.maxConns));
     if (!server.listen(opt.bindAddr, opt.port)) {
         uv_loop_close(&loop);
         return 1;

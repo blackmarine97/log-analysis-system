@@ -21,6 +21,8 @@ receiving it**, aggregates statistics, and returns `result.csv` to the client.
 │   ├── TcpServer.h    #   listener, owns sessions via unique_ptr
 │   ├── Logger.h       #   async logger: bounded queue + writer thread
 │   ├── CsvWriter.h    #   result.csv copy via uv_queue_work (thread pool)
+│   ├── ResultCache.h  #   memory+disk cache, re-serves results on FetchResult
+│   ├── SpoolStore.h   #   on-disk partial uploads, powers resumable uploads
 │   ├── main.cpp
 │   └── tests/         #   parser + logger unit tests, CLI test client
 ├── client/            # Windows GUI client (Dear ImGui + DX11)
@@ -44,11 +46,17 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ./build/server/log_server [--port 5555] [--bind 0.0.0.0] [--daemon]
                           [--log server.log] [--csv result.csv]
-                          [--idle-timeout 60]
+                          [--idle-timeout 60] [--max-conns 32]
+                          [--cache-dir results]
 ```
 
 `--idle-timeout SEC` closes a connection that makes no progress for that
-long (default 60 s, `0` disables) — see *Robustness on disconnect*.
+long (default 60 s, `0` disables); `--max-conns N` caps concurrent
+connections (default 32); `--cache-dir DIR` is where finished analyses are
+kept for `FetchResult` retries (default `results/`); `--spool-dir DIR` is
+where partially received uploads are kept so they can be RESUMED (default
+`spool/`, 2 GiB budget; empty string disables either) — see *Robustness on
+disconnect & abuse*.
 
 **Launchers.** To start the prebuilt server with defaults (port 5555, CSV
 copy to `./result.csv`, log to the console) without typing the path:
@@ -118,6 +126,12 @@ socket failures surface as human-readable messages
 The **Activity log** pane lists events newest-first and can be emptied with
 **Clear log**.
 
+The progress bar is phase-honest: a full bar during upload means "all bytes
+handed to the network", the overlay then switches to *server verifying &
+analyzing*, and only the CRC-checked response promotes the state to *done*
+— the response frame is the acknowledgement that the server received the
+exact bytes and finished processing them.
+
 > Build the client on a local drive. From a `\\wsl.localhost\...` path
 > Windows git refuses to clone Dear ImGui ("dubious ownership") and MSBuild
 > cannot track dependencies on a network share; copy `client/` and `common/`
@@ -125,15 +139,42 @@ The **Activity log** pane lists events newest-first and can be emptied with
 
 ## Network Architecture
 
-Every message is one length-prefixed frame — no delimiters, no ambiguity,
-and the receiver always knows exactly how many bytes remain:
+Every message is one length-prefixed frame (protocol v2) — no delimiters,
+no ambiguity, and the receiver always knows exactly how many bytes remain.
+A CRC-32 trailer covers the payload so corruption in transit is detected,
+in both directions:
 
 ```
-+--------------+-----+------+----------+---------------------+----------------+
-| magic "BLOG" | ver | type | reserved | payloadSize (8B LE) | payload ...    |
-+--------------+-----+------+----------+---------------------+----------------+
-   4 bytes       1     1        2            8                 payloadSize
++--------------+-----+------+----------+---------------------+-------------+--------------+
+| magic "BLOG" | ver | type | reserved | payloadSize (8B LE) | payload ... | CRC-32 (4B)  |
++--------------+-----+------+----------+---------------------+-------------+--------------+
+   4 bytes       1     1        2            8                 payloadSize      trailer
 ```
+
+Both sides compute the CRC incrementally while streaming (slice-by-8,
+multi-GB/s — the byte-at-a-time version measurably doubled upload time), so
+verification costs no extra pass and no buffering. On a mismatch the server
+answers with an Error frame and discards the analysis — a corrupted upload
+can never be presented as a result — and the client refuses to save a
+result.csv whose trailer does not match. Verified end-to-end with
+`test_client --corrupt N`, which flips one payload byte in flight.
+
+**Message types**: `UploadLog` (client→server, payload = log bytes),
+`ResultCsv` / `Error` (server→client), and `FetchResult` (client→server,
+payload = 12 bytes: file size + upload CRC-32). `FetchResult` re-requests
+an analysis the server already performed — see *response-direction
+robustness* below. The upload's CRC doubles as the natural lookup key: the
+client already holds it, and it identifies the exact bytes that were
+analysed.
+
+Uploads are **resumable** (v3): the `UploadLog` payload starts with a
+16-byte prefix (upload id + start offset), and `ResumeQuery` /
+`ResumeOffset` let a client ask "how much of upload *id* do you already
+have?" before sending. The id is derived deterministically from the file
+(CRC of the first MiB + size), so no client-side state must survive a
+crash; the CRC trailer always covers the WHOLE file, so a stale or
+mismatched spool fails verification exactly like corruption in transit and
+falls back to a full upload.
 
 ```mermaid
 sequenceDiagram
@@ -192,12 +233,20 @@ synchronous write (1.4 s vs 0.87 s per upload on a 5 %-corrupt file). The
 Checked with ThreadSanitizer (0 reports) and valgrind (0 bytes in use at
 exit, 0 errors) on an upload + mid-transfer abort + SIGTERM scenario.
 
-### Robustness on disconnect
+### Robustness on disconnect & abuse
 
 - Server: a read error (`ECONNRESET`, EOF mid-payload) is logged and the
   session is closed and reclaimed; the server keeps serving. Verified by
   hard-closing the socket after 200 MB — the very next upload succeeded and
   produced a byte-identical CSV.
+- Connection flood: concurrent sessions are capped (`--max-conns`, default
+  32). Arrivals beyond the cap are accepted only to receive an Error frame
+  ("server busy") and are closed — file descriptors and per-session memory
+  cannot be exhausted by opening sockets.
+- Log injection: corrupt lines are quoted in the server log with every
+  non-printable byte rendered as `\xNN` (`sanitizeForLog`), so poison data
+  containing newlines or ANSI escapes cannot forge log entries or garble
+  the terminal of whoever reads the log.
 - Server, silent peer: a client that vanishes without FIN/RST (power loss,
   pulled cable, NAT eviction) or connects and never sends produces no
   socket error at all, so each session also carries a libuv idle timer
@@ -207,6 +256,34 @@ exit, 0 errors) on an upload + mid-transfer abort + SIGTERM scenario.
   and leak file descriptors. Verified under valgrind: two stalled
   connections (no bytes / 5-byte partial header) were reclaimed after the
   timeout while a concurrent upload completed normally — no leaks.
+- Response direction — result re-fetch: robustness is not only about the
+  request. If the connection drops (or the response arrives damaged) while
+  `result.csv` is in flight, the analysis the server just spent CPU on is
+  not lost with the socket: the server retains recent results in a
+  two-tier cache (see `ResultCache.h`) keyed by the upload's (size, CRC) —
+  8 MB in memory, plus a copy under `--cache-dir` (default `results/`,
+  64 MB budget, oldest pruned, atomic tmp+rename writes on the libuv
+  thread pool) **so results survive a server restart**. The client then
+  reconnects and sends a 12-byte `FetchResult` frame instead of
+  re-uploading 500 MB — the GUI does this automatically with exponential
+  backoff (5 attempts over ~15 s, cancellable, visible in the status
+  line), which spans a service restart; `test_client --drop-result` /
+  `--fetch` demonstrate it from the CLI, including across a restart.
+  A miss in both tiers is an explicit Error and the client falls back to
+  a normal upload.
+- Request direction — resumable uploads: every received payload byte is
+  also spooled to `--spool-dir` (atomic per-chunk appends; oldest spools
+  pruned past a 2 GiB budget; see `SpoolStore.h`). If the connection —
+  or the whole server — dies mid-upload, the next attempt asks
+  `ResumeQuery` and continues from the spooled offset instead of resending
+  everything; the server rebuilds parser + CRC state by re-parsing the
+  spooled prefix (~0.6 s per 500 MB, a deliberate synchronous trade on the
+  rare recovery path). The GUI retries this automatically with the same
+  exponential backoff, and its progress bar CONTINUES from the resume
+  point. Verified end-to-end on Windows: server hard-killed at 5%%,
+  restarted 1 s later -> "resuming upload from 4%% (server kept 22 MiB)"
+  -> done, result identical to an uninterrupted upload. On success the
+  spool is deleted (the recoverable artifact becomes the cached result).
 - Client: all blocking calls carry a 30 s `SO_SNDTIMEO`/`SO_RCVTIMEO`;
   a lost connection surfaces as a failed `send`/`recv`, the worker logs it,
   the RAII socket wrapper releases the handle, and the UI shows *failed*.
@@ -224,7 +301,10 @@ The 500 MB file is **never** held in memory, on either side:
 - A poison "line" that never ends is capped: if the carry buffer exceeds
   1 MiB without a newline it is dropped as one malformed line and the
   parser resynchronizes at the next `\n`. It is counted exactly once no
-  matter how many `feed()` calls it spans.
+  matter how many `feed()` calls it spans. The newline search remembers how
+  far previous `feed()`s already scanned, so this worst case stays linear
+  (measured 19x faster than rescanning: 256 MiB of newline-free input in
+  7 ms instead of 128 ms).
 - Statistics are running aggregates (count map + sum/count for the average),
   so memory does not grow with the line count. The one input-dependent
   structure is the `(date_hour, module)` map; since corrupt data could invent
@@ -352,6 +432,37 @@ validation costs ~0.2 s per 500 MB over a parser that only searched for
 `spd[` (0.83 s vs 0.63 s end-to-end on loopback, ≈600 MB/s) — still far above
 any network link, and the bracket scan is `memchr`-based rather than
 per-character for exactly that reason.
+
+## Interpretation Decisions (they change the numbers)
+
+The task statement leaves genuine ambiguities. Different defensible readings
+produce **different result numbers from the same file**, so the choices made
+here are stated explicitly rather than left implicit in code:
+
+1. **Does a line with a corrupt `spd` value still count as an occurrence of
+   its module?** Chosen: **no — the whole line is excluded from every
+   statistic** (both the Task 1 counts and the Task 2 average). Rationale: a
+   record with one provably corrupted field cannot be trusted as a whole;
+   half-counting it would make `module_count` and `parsed_lines` disagree
+   about what a "valid line" is. Impact on the sample file: the 6
+   `spd[8.9e20]` lines are skipped entirely, giving
+   `parsed_lines = 3,483,502`. Under the alternative reading ("the line is
+   structurally fine, only the speed is unusable") those 6 lines would be
+   counted, giving `parsed_lines = 3,483,508` and adding a `BeyondLimit`
+   row to the counts — same code, different answer. Anyone comparing
+   outputs across implementations must first agree on this definition.
+2. **Which payload fields are validated, and on what authority?** The
+   known-key shape rules (`nodeUID`/`rfLane` → integer, `lockState` →
+   `int->int`) are **derived from the sample file, which is an example,
+   not a specification**. Module names are deliberately *not* hardcoded
+   (any identifier is accepted) and unknown keys are *not* validated, so a
+   module that never appeared in the sample flows through normally. The
+   residual risk is the reverse case: if a future module legitimately uses
+   e.g. `nodeUID[none]`, its lines would be skipped. That failure mode is
+   **visible, not silent** — it surfaces as a spike in one
+   `skipped_InvalidNodeUid`-style counter in the CSV summary and in the
+   per-line log, which is exactly the signal to revisit the rule. This is
+   the documented trade-off for rejecting the sample's poison payloads.
 
 ## result.csv Format
 

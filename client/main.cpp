@@ -243,6 +243,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     auto uiLog = [&](std::string msg) {
         logLines.push_back(std::move(msg));
     };
+    // Build stamp in the log: removes any doubt about WHICH exe is running
+    // when diagnosing behaviour differences.
+    uiLog(std::string("log_client build ") + __DATE__ + " " + __TIME__);
 
     auto selectFile = [&](const std::wstring& p) {
         logPath = p;
@@ -289,6 +292,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                 finalElapsedSec =
                     std::chrono::duration<double>(Clock::now() - xferStart)
                         .count();
+            }
+            if (st == XferState::Failed || st == XferState::Cancelled) {
+                // Diagnostic: record exactly where the transfer stopped, so
+                // the held progress bar can be cross-checked against data.
+                char b[128];
+                std::snprintf(b, sizeof(b),
+                              "%s at %.1f%% (%llu / %llu MiB kept on the bar)",
+                              st == XferState::Cancelled ? "cancelled"
+                                                         : "failed",
+                              static_cast<double>(net.progress()) * 100.0,
+                              static_cast<unsigned long long>(net.bytesSent() >> 20),
+                              static_cast<unsigned long long>(net.bytesTotal() >> 20));
+                uiLog(b);
             }
             if (st == XferState::Done) {
                 summary = parseSummary(net.resultCsv());
@@ -391,12 +407,32 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         ImGui::Checkbox("Auto-save next to log", &autoSave);
 
         // -- progress
+        // Honest phases: a full bar means "all bytes handed to the network",
+        // not "the server is done". Delivery is only confirmed once the
+        // server's CRC-checked response arrives (state *done*).
         ImGui::Spacing();
         char overlay[96];
-        std::snprintf(overlay, sizeof(overlay), "%.1f%%  (%llu / %llu MiB)",
-                      static_cast<double>(net.progress()) * 100.0,
-                      static_cast<unsigned long long>(net.bytesSent() >> 20),
-                      static_cast<unsigned long long>(net.bytesTotal() >> 20));
+        if (st == XferState::WaitingResult)
+            std::snprintf(overlay, sizeof(overlay),
+                          "100%% sent (%llu MiB) - server verifying & analyzing...",
+                          static_cast<unsigned long long>(net.bytesTotal() >> 20));
+        else if (st == XferState::Done)
+            std::snprintf(overlay, sizeof(overlay),
+                          "done - result received & checksum-verified");
+        else if (st == XferState::Cancelled || st == XferState::Failed)
+            // The bar deliberately HOLDS the position where the transfer
+            // stopped (it resets only when a new upload starts).
+            std::snprintf(overlay, sizeof(overlay),
+                          "%s at %.1f%%  (%llu / %llu MiB)",
+                          st == XferState::Cancelled ? "cancelled" : "failed",
+                          static_cast<double>(net.progress()) * 100.0,
+                          static_cast<unsigned long long>(net.bytesSent() >> 20),
+                          static_cast<unsigned long long>(net.bytesTotal() >> 20));
+        else
+            std::snprintf(overlay, sizeof(overlay), "%.1f%%  (%llu / %llu MiB)",
+                          static_cast<double>(net.progress()) * 100.0,
+                          static_cast<unsigned long long>(net.bytesSent() >> 20),
+                          static_cast<unsigned long long>(net.bytesTotal() >> 20));
         ImGui::ProgressBar(net.progress(), ImVec2(-1, 0),
                            net.bytesTotal() ? overlay : "");
 

@@ -50,6 +50,7 @@ endif()
 add_executable(parser_test tests/parser_test.cpp)
 target_compile_options(parser_test PRIVATE ${COMMON_WARNINGS})
 target_include_directories(parser_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(parser_test PRIVATE Threads::Threads)   # Logger.h (sanitizeForLog)
 
 add_executable(logger_test tests/logger_test.cpp)
 target_compile_options(logger_test PRIVATE ${COMMON_WARNINGS})

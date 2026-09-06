@@ -7,6 +7,8 @@ out/
 Test_Log.log
 
 # local run artifacts
+results/
+spool/
 *.csv
 *.csv.tmp.*
 server.log

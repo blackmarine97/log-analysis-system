@@ -1,6 +1,8 @@
 // Verifies LineParser/StreamParser against the real BYDA sample + poison data,
 // while simulating arbitrary network chunk boundaries.
 #include "StreamParser.h"
+#include "../../common/Protocol.h"
+#include "../Logger.h"   // sanitizeForLog
 
 #include <cassert>
 #include <cmath>
@@ -168,6 +170,17 @@ int main(int argc, char** argv) {
               "parsed_lines = 0 when every line was dropped");
     }
 
+    // ---- 1d. sanitizeForLog: control chars / newlines neutralised --------
+    std::cout << "[sanitizeForLog]\n";
+    {
+        CHECK(sanitizeForLog("plain text") == "plain text",
+              "printable ASCII passes through");
+        CHECK(sanitizeForLog("a\nb\r\x1b[31m") == "a\\x0ab\\x0d\\x1b[31m",
+              "newline/CR/ESC become \\xNN (no log injection)");
+        CHECK(sanitizeForLog(std::string(200, 'x')).size() == 123,
+              "capped at 120 chars + \"...\"");
+    }
+
     // ---- 2. Stream test: sample file fed in tiny chunks ----------------
     std::cout << "[StreamParser chunk-boundary test]\n";
     const char* path = (argc > 1) ? argv[1] : "sample.log";
@@ -217,6 +230,49 @@ int main(int argc, char** argv) {
     // ---- 3. CSV output --------------------------------------------------
     std::cout << "[result.csv]\n";
     sp.writeCsv(std::cout);
+
+    // ---- 4. CRC-32 trailer: roundtrip + corruption detection ------------
+    std::cout << "[CRC-32 framing]\n";
+    {
+        auto crcOf = [](std::string_view d) {
+            return proto::crc32Final(
+                proto::crc32Update(proto::kCrc32Init, d.data(), d.size()));
+        };
+        // Known-answer: CRC-32("123456789") == 0xCBF43926.
+        CHECK(crcOf("123456789") == 0xCBF43926u, "CRC-32 known-answer vector");
+        // Incremental (split) equals one-shot.
+        const std::string msg = "the quick brown fox";
+        uint32_t c = proto::kCrc32Init;
+        for (char ch : msg) c = proto::crc32Update(c, &ch, 1);
+        CHECK(proto::crc32Final(c) == crcOf(msg), "byte-by-byte == one-shot");
+        // Trailer encode/decode roundtrip.
+        std::array<char, proto::kTrailerSize> tr{};
+        proto::encodeTrailer(crcOf(msg), tr);
+        CHECK(proto::decodeTrailer(tr) == crcOf(msg), "trailer encode/decode");
+        // A single bit flip changes the CRC (detection).
+        std::string bad = msg; bad[0] ^= 0x01;
+        CHECK(crcOf(bad) != crcOf(msg), "1-bit change flips the CRC");
+        // Resume codecs: encode/decode roundtrips.
+        std::array<char, proto::kUploadPrefixSize> up{};
+        proto::encodeUploadPrefix(0x1e2d52de4e1b70b8ull, 200278016ull, up);
+        uint64_t uid = 0, uoff = 0;
+        proto::decodeUploadPrefix(up, uid, uoff);
+        CHECK(uid == 0x1e2d52de4e1b70b8ull && uoff == 200278016ull,
+              "upload prefix encode/decode roundtrip");
+        std::array<char, proto::kResumeKeySize> rk{};
+        proto::encodeResumeKey(0xAABBCCDDull, 506286814ull, rk);
+        uint64_t rid = 0, rsz = 0;
+        proto::decodeResumeKey(rk, rid, rsz);
+        CHECK(rid == 0xAABBCCDDull && rsz == 506286814ull,
+              "resume key encode/decode roundtrip");
+        // FetchResult key: encode/decode roundtrip.
+        std::array<char, proto::kFetchKeySize> key{};
+        proto::encodeFetchKey(506286814ull, 0x73f70919u, key);
+        uint64_t fs = 0; uint32_t fc = 0;
+        proto::decodeFetchKey(key, fs, fc);
+        CHECK(fs == 506286814ull && fc == 0x73f70919u,
+              "fetch key encode/decode roundtrip");
+    }
 
     std::cout << (gFailures == 0 ? "\nALL CHECKS PASSED\n"
                                  : "\nFAILURES PRESENT\n");

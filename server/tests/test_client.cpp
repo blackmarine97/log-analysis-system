@@ -3,10 +3,26 @@
 //
 //   ./test_client <host> <port> <logfile> [out.csv]
 //   ./test_client <host> <port> <logfile> --abort <bytes>
+//   ./test_client <host> <port> <logfile> --corrupt <bytes>
+//   ./test_client <host> <port> <logfile> --drop-result
+//   ./test_client <host> <port> <logfile> --fetch [out.csv]
 //
 // --abort N hard-closes the socket after sending ~N payload bytes, which is
 // the "network yanked mid-transfer" robustness scenario from the assignment:
 // the server must log the error and clean up, never crash.
+// --corrupt N flips one payload byte at offset ~N while still sending the
+// CRC of the ORIGINAL file: simulates corruption in transit, which the
+// server must detect and answer with an Error frame, never a result.
+// --drop-result uploads everything, then closes without reading the
+// response — "connection lost while the result was in flight". --fetch then
+// retrieves that result with a 12-byte FetchResult frame (the key is the
+// file's size + CRC, recomputed locally) instead of a 500 MB re-upload.
+//
+// Uploads are resumable (protocol v3): before uploading, the client asks
+// ResumeQuery("how much of upload <id> do you have?") and continues from
+// the server's answer instead of resending those bytes. The upload id is
+// derived deterministically from the file (CRC of the first MiB + size),
+// so a rerun after --abort automatically picks up where it stopped.
 
 #include "common/Protocol.h"
 
@@ -75,6 +91,77 @@ bool recvAll(int fd, char* data, size_t len) {
     return true;
 }
 
+// Deterministic upload id: CRC of the first MiB + the low 32 bits of the
+// size. Needs no client-side state across runs; a collision (different file,
+// same id) is caught by the full-file CRC trailer and merely costs a restart.
+uint64_t computeUploadId(std::ifstream& in, uint64_t fileSize) {
+    std::vector<char> buf(1 << 20);
+    in.seekg(0);
+    in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+    const auto n = in.gcount();
+    in.clear();
+    in.seekg(0);
+    const uint32_t c = proto::crc32Final(proto::crc32Update(
+        proto::kCrc32Init, buf.data(), static_cast<size_t>(n > 0 ? n : 0)));
+    return static_cast<uint64_t>(c) |
+           (static_cast<uint64_t>(static_cast<uint32_t>(fileSize)) << 32);
+}
+
+int connectTo(const std::string& host, const std::string& port, UniqueFd& fd) {
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* raw = nullptr;
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &raw) != 0 || !raw)
+        return -1;
+    std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> res(raw, &freeaddrinfo);
+    fd.reset(::socket(res->ai_family, res->ai_socktype, res->ai_protocol));
+    if (!fd) return -1;
+    return ::connect(fd.get(), res->ai_addr, res->ai_addrlen);
+}
+
+// Sends a fixed-size-payload request frame (key + trailer). Returns false on
+// any socket failure.
+bool sendSmallFrame(int fd, proto::MsgType type,
+                    const char* payload, size_t n) {
+    std::array<char, proto::kHeaderSize> h{};
+    proto::encodeHeader({type, n}, h);
+    std::array<char, proto::kTrailerSize> tr{};
+    proto::encodeTrailer(
+        proto::crc32Final(proto::crc32Update(proto::kCrc32Init, payload, n)),
+        tr);
+    return sendAll(fd, h.data(), h.size()) && sendAll(fd, payload, n) &&
+           sendAll(fd, tr.data(), tr.size());
+}
+
+// Asks the server how much of this upload is already spooled. 0 on any
+// failure — the caller just uploads from the start.
+uint64_t queryResumeOffset(const std::string& host, const std::string& port,
+                           uint64_t uploadId, uint64_t fileSize) {
+    UniqueFd fd;
+    if (connectTo(host, port, fd) != 0) return 0;
+    std::array<char, proto::kResumeKeySize> key{};
+    proto::encodeResumeKey(uploadId, fileSize, key);
+    if (!sendSmallFrame(fd.get(), proto::MsgType::ResumeQuery,
+                        key.data(), key.size()))
+        return 0;
+    std::array<char, proto::kHeaderSize> rh{};
+    if (!recvAll(fd.get(), rh.data(), rh.size())) return 0;
+    const auto h = proto::decodeHeader(std::string_view(rh.data(), rh.size()));
+    if (!h || h->type != proto::MsgType::ResumeOffset || h->payloadSize != 8)
+        return 0;
+    std::array<char, 8> body{};
+    std::array<char, proto::kTrailerSize> tr{};
+    if (!recvAll(fd.get(), body.data(), body.size()) ||
+        !recvAll(fd.get(), tr.data(), tr.size()))
+        return 0;
+    if (proto::decodeTrailer(tr) !=
+        proto::crc32Final(proto::crc32Update(proto::kCrc32Init,
+                                             body.data(), body.size())))
+        return 0;
+    return proto::leGet64(body.data());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -87,10 +174,18 @@ int main(int argc, char** argv) {
     const std::string port = argv[2];
     const std::string path = argv[3];
     std::string outPath = "result.csv";
-    long long abortAfter = -1;
+    long long abortAfter = -1, corruptAt = -1;
+    bool dropResult = false, fetchMode = false;
     if (argc >= 6 && std::string(argv[4]) == "--abort")
         abortAfter = std::atoll(argv[5]);
-    else if (argc >= 5)
+    else if (argc >= 6 && std::string(argv[4]) == "--corrupt")
+        corruptAt = std::atoll(argv[5]);
+    else if (argc >= 5 && std::string(argv[4]) == "--drop-result")
+        dropResult = true;
+    else if (argc >= 5 && std::string(argv[4]) == "--fetch") {
+        fetchMode = true;
+        if (argc >= 6) outPath = argv[5];
+    } else if (argc >= 5)
         outPath = argv[4];
 
     std::signal(SIGPIPE, SIG_IGN);
@@ -100,31 +195,68 @@ int main(int argc, char** argv) {
     const uint64_t fileSize = static_cast<uint64_t>(in.tellg());
     in.seekg(0);
 
-    addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* raw = nullptr;
-    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &raw) != 0 || !raw) {
-        std::cerr << "cannot resolve " << host << '\n';
-        return 1;
-    }
-    // Owned by unique_ptr so freeaddrinfo() runs on every exit path.
-    std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> res(raw, &freeaddrinfo);
-    UniqueFd fd(::socket(res->ai_family, res->ai_socktype, res->ai_protocol));
-    const int rc = fd ? ::connect(fd.get(), res->ai_addr, res->ai_addrlen) : -1;
-    res.reset();
-    if (!fd || rc != 0) {
+    UniqueFd fd;
+    if (connectTo(host, port, fd) != 0) {
         std::cerr << "connect failed: " << std::strerror(errno) << '\n';
         return 1;
     }
 
-    // ---- upload: [header][file bytes in 1 MiB chunks] -------------------
-    std::array<char, proto::kHeaderSize> hdr{};
-    proto::encodeHeader({proto::MsgType::UploadLog, fileSize}, hdr);
-    if (!sendAll(fd.get(), hdr.data(), hdr.size())) return 1;
+    if (fetchMode) {
+        // ---- FetchResult: re-request a cached analysis by (size, crc) ----
+        std::vector<char> fbuf(1 << 20);
+        uint32_t fcrc = proto::kCrc32Init;
+        while (in) {
+            in.read(fbuf.data(), static_cast<std::streamsize>(fbuf.size()));
+            if (in.gcount() > 0)
+                fcrc = proto::crc32Update(fcrc, fbuf.data(),
+                                          static_cast<size_t>(in.gcount()));
+        }
+        std::array<char, proto::kFetchKeySize> key{};
+        proto::encodeFetchKey(fileSize, proto::crc32Final(fcrc), key);
+        std::array<char, proto::kHeaderSize> fh{};
+        proto::encodeHeader({proto::MsgType::FetchResult, key.size()}, fh);
+        std::array<char, proto::kTrailerSize> ftr{};
+        proto::encodeTrailer(
+            proto::crc32Final(proto::crc32Update(proto::kCrc32Init,
+                                                 key.data(), key.size())),
+            ftr);
+        if (!sendAll(fd.get(), fh.data(), fh.size()) ||
+            !sendAll(fd.get(), key.data(), key.size()) ||
+            !sendAll(fd.get(), ftr.data(), ftr.size())) return 1;
+        std::cout << "FETCH: requested cached result (12-byte key, "
+                     "no re-upload)\n";
+    } else {
 
+    // ---- upload: resume-aware [header][prefix][file bytes] --------------
+    const uint64_t uploadId = computeUploadId(in, fileSize);
+    uint64_t offset = queryResumeOffset(host, port, uploadId, fileSize);
+    if (offset > 0)
+        std::cout << "RESUME: server already has " << offset
+                  << " bytes, continuing from there\n";
+
+    std::array<char, proto::kHeaderSize> hdr{};
+    proto::encodeHeader({proto::MsgType::UploadLog,
+                         proto::kUploadPrefixSize + (fileSize - offset)}, hdr);
+    if (!sendAll(fd.get(), hdr.data(), hdr.size())) return 1;
+    std::array<char, proto::kUploadPrefixSize> prefix{};
+    proto::encodeUploadPrefix(uploadId, offset, prefix);
+    if (!sendAll(fd.get(), prefix.data(), prefix.size())) return 1;
+
+    // The trailer CRC covers the WHOLE file: on resume, re-read the local
+    // prefix to bring the running CRC up to `offset` before sending.
     std::vector<char> buf(1 << 20);
+    uint32_t crc = proto::kCrc32Init;
     uint64_t sent = 0;
+    while (sent < offset) {
+        const uint64_t remaining = offset - sent;
+        const size_t want = remaining < buf.size()
+                                ? static_cast<size_t>(remaining) : buf.size();
+        in.read(buf.data(), static_cast<std::streamsize>(want));
+        const std::streamsize n = in.gcount();
+        if (n <= 0) { std::cerr << "file read error\n"; return 1; }
+        crc = proto::crc32Update(crc, buf.data(), static_cast<size_t>(n));
+        sent += static_cast<uint64_t>(n);
+    }
     while (sent < fileSize) {
         // Clamp to the size announced in the header: a log that grows during
         // the upload must not push bytes past the end of the frame payload.
@@ -135,6 +267,16 @@ int main(int argc, char** argv) {
         in.read(buf.data(), static_cast<std::streamsize>(want));
         const std::streamsize n = in.gcount();
         if (n <= 0) { std::cerr << "file read error\n"; return 1; }
+        // CRC over the ORIGINAL bytes, then (optionally) corrupt one byte:
+        // the server must notice that what arrived is not what was hashed.
+        crc = proto::crc32Update(crc, buf.data(), static_cast<size_t>(n));
+        if (corruptAt >= 0 &&
+            static_cast<uint64_t>(corruptAt) >= sent &&
+            static_cast<uint64_t>(corruptAt) < sent + static_cast<uint64_t>(n)) {
+            buf[static_cast<size_t>(corruptAt - static_cast<long long>(sent))] ^= 0x01;
+            std::cout << "CORRUPT: flipped payload byte at offset "
+                      << corruptAt << "\n";
+        }
         if (!sendAll(fd.get(), buf.data(), static_cast<size_t>(n))) return 1;
         sent += static_cast<uint64_t>(n);
 
@@ -146,7 +288,17 @@ int main(int argc, char** argv) {
         std::cout << "\rupload " << (sent * 100 / fileSize) << "% ("
                   << (sent >> 20) << " MiB)" << std::flush;
     }
+    std::array<char, proto::kTrailerSize> tr{};
+    proto::encodeTrailer(proto::crc32Final(crc), tr);
+    if (!sendAll(fd.get(), tr.data(), tr.size())) return 1;
+    if (dropResult) {
+        std::cout << "\nDROP-RESULT: upload complete, closing without "
+                     "reading the response (simulates a download-side "
+                     "disconnect)\n";
+        return 0;   // UniqueFd closes the socket
+    }
     std::cout << "\nupload done, waiting for result...\n";
+    }   // !fetchMode
 
     // ---- response frame -------------------------------------------------
     std::array<char, proto::kHeaderSize> rhdr{};
@@ -158,6 +310,14 @@ int main(int argc, char** argv) {
     std::string body(h->payloadSize, '\0');
     if (h->payloadSize > 0 &&
         !recvAll(fd.get(), body.data(), body.size())) return 1;
+    std::array<char, proto::kTrailerSize> rtr{};
+    if (!recvAll(fd.get(), rtr.data(), rtr.size())) return 1;
+    if (proto::decodeTrailer(rtr) !=
+        proto::crc32Final(proto::crc32Update(proto::kCrc32Init,
+                                             body.data(), body.size()))) {
+        std::cerr << "response checksum mismatch\n";
+        return 1;
+    }
 
     if (h->type == proto::MsgType::Error) {
         std::cerr << "server error: " << body << '\n';

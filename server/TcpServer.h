@@ -4,6 +4,8 @@
 // handle fully closed, which makes use-after-free impossible by construction.
 
 #include "Logger.h"
+#include "ResultCache.h"
+#include "SpoolStore.h"
 #include "Session.h"
 
 #include <uv.h>
@@ -15,9 +17,14 @@
 
 class TcpServer {
 public:
+    // maxSessions: hard cap on concurrent connections. Arrivals beyond it
+    // are accepted only to receive an Error frame and are closed, so a
+    // connection flood cannot exhaust fds / per-session memory.
     TcpServer(uv_loop_t* loop, Logger& log, CsvWriter& csv,
-              uint64_t idleTimeoutMs)
-        : loop_(loop), log_(log), csv_(csv), idleTimeoutMs_(idleTimeoutMs) {
+              ResultCache& cache, SpoolStore& spool,
+              uint64_t idleTimeoutMs, size_t maxSessions)
+        : loop_(loop), log_(log), csv_(csv), cache_(cache), spool_(spool),
+          idleTimeoutMs_(idleTimeoutMs), maxSessions_(maxSessions) {
         uv_tcp_init(loop_, &listener_);
         listener_.data = this;
     }
@@ -72,13 +79,25 @@ private:
         }
         const uint64_t id = self->nextId_++;
         auto session = std::make_unique<Session>(
-            self->loop_, id, self->log_, self->csv_, self->idleTimeoutMs_,
+            self->loop_, id, self->log_, self->csv_, self->cache_,
+            self->spool_, self->idleTimeoutMs_,
             [self](Session* s) { self->sessions_.erase(s); });
 
         Session* raw = session.get();
         self->sessions_.emplace(raw, std::move(session));
-        self->log_.info("session " + std::to_string(id) + ": accepted");
 
+        // At capacity (the new session included): refuse politely. The
+        // rejected session still lives in the map until its close callback,
+        // like any other, so no special lifetime path exists.
+        if (self->sessions_.size() > self->maxSessions_) {
+            self->log_.warn("session " + std::to_string(id) +
+                            ": rejected, connection limit (" +
+                            std::to_string(self->maxSessions_) + ") reached");
+            if (!raw->acceptBusy(listener)) raw->close();
+            return;
+        }
+
+        self->log_.info("session " + std::to_string(id) + ": accepted");
         if (!raw->accept(listener)) {
             self->log_.error("session " + std::to_string(id) +
                              ": accept/read_start failed");
@@ -90,7 +109,10 @@ private:
     uv_tcp_t    listener_{};
     Logger&     log_;
     CsvWriter&  csv_;
+    ResultCache& cache_;
+    SpoolStore& spool_;
     uint64_t    idleTimeoutMs_;
+    size_t      maxSessions_;
     bool        shuttingDown_ = false;
     uint64_t    nextId_ = 1;
     std::unordered_map<Session*, std::unique_ptr<Session>> sessions_;
