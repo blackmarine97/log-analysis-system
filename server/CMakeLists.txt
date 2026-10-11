@@ -2,7 +2,7 @@
 #
 # libuv resolution order:
 #   1. system package (libuv1-dev)  -- fast path
-#   2. FetchContent from GitHub     -- zero-setup fallback for graders
+#   2. FetchContent from GitHub     -- zero-setup fallback on a fresh machine
 #
 # LOG_SERVER_STATIC=ON builds the distributable binary in bin/: libuv is
 # always fetched and linked statically and the executable is fully static
